@@ -11,7 +11,7 @@ from discord import app_commands
 
 from .allowlist import Allowlist
 from .config import Config
-from .downloader import Downloader, DownloadError
+from .downloader import Downloader, DownloadError, Media, is_video
 from .links import ReelLink, find_link
 
 log = logging.getLogger(__name__)
@@ -19,6 +19,33 @@ log = logging.getLogger(__name__)
 PRIVATE_MSG = "This bot is private."
 NO_LINK_MSG = "I couldn't find an Instagram reel or post link there."
 OWNER_ONLY_MSG = "Only the bot owner can do that."
+
+MAX_FILES_PER_MESSAGE = 10  # Discord's attachment limit per message
+
+
+def plan_batches(sizes: list[int], limit: int, max_files: int = MAX_FILES_PER_MESSAGE) -> list[list[int]]:
+    """Group file indexes, in order, into messages of at most ``max_files`` files and ``limit`` bytes."""
+    batches: list[list[int]] = []
+    total = 0
+    for i, size in enumerate(sizes):
+        if not batches or len(batches[-1]) >= max_files or total + size > limit:
+            batches.append([])
+            total = 0
+        batches[-1].append(i)
+        total += size
+    return batches
+
+
+def attachment_names(paths: list[Path]) -> list[str]:
+    """``reel.mp4`` for a lone video, otherwise numbered names that keep post order."""
+    if len(paths) == 1 and is_video(paths[0]):
+        return ["reel.mp4"]
+    names = []
+    for i, p in enumerate(paths, 1):
+        ext = ".mp4" if is_video(p) else p.suffix.lower().replace(".jpeg", ".jpg")
+        names.append(f"{i:02}{ext}")
+    return names
+
 
 # Applied to every command so they work when user-installed: DMs, group DMs and servers.
 installs = app_commands.allowed_installs(guilds=True, users=True)
@@ -74,7 +101,7 @@ class ReelBot(discord.Client):
 
         with tempfile.TemporaryDirectory(prefix="reelbot-", ignore_cleanup_errors=True) as tmp:
             try:
-                path = await self.downloader.fetch(link.url, Path(tmp), limit)
+                media = await self.downloader.fetch(link, Path(tmp), limit)
             except DownloadError as e:
                 reason = str(e)
                 log.warning("failed user=%s link=%s reason=%s", user_id, link.url, reason)
@@ -82,21 +109,39 @@ class ReelBot(discord.Client):
                 reason = "something went wrong"
                 log.exception("error user=%s link=%s", user_id, link.url)
             else:
-                try:
-                    await interaction.followup.send(file=discord.File(path, filename="reel.mp4"))
-                except discord.HTTPException as e:
-                    reason = "the video is too large to upload" if e.status == 413 else "Discord rejected the upload"
-                    log.warning("upload-failed user=%s link=%s status=%s code=%s", user_id, link.url, e.status, e.code)
-                else:
-                    log.info("sent user=%s link=%s bytes=%d", user_id, link.url, path.stat().st_size)
+                reason = await self._send_media(interaction, link, media, limit)
+                if reason is None:
                     return
 
         await self._send_fallback(interaction, link, reason)
 
+    async def _send_media(
+        self, interaction: discord.Interaction, link: ReelLink, media: Media, limit: int
+    ) -> str | None:
+        """Upload the files in as few messages as possible. Returns a failure reason, or None."""
+        names = attachment_names(media.files)
+        batches = plan_batches([p.stat().st_size for p in media.files], limit)
+        sent = 0
+        for n, batch in enumerate(batches):
+            content = None
+            if n == len(batches) - 1 and media.skipped:
+                content = f"-# {media.skipped} item(s) were too large to post. Full post: <{link.url}>"
+            files = [discord.File(media.files[i], filename=names[i]) for i in batch]
+            try:
+                await interaction.followup.send(content=content, files=files)
+            except discord.HTTPException as e:
+                log.warning("upload-failed user=%s link=%s status=%s code=%s", interaction.user.id, link.url, e.status, e.code)
+                if sent == 0:
+                    return "the media is too large to upload" if e.status == 413 else "Discord rejected the upload"
+                return None  # part of the post is already up; don't follow it with a fallback link
+            sent += len(batch)
+        log.info("sent user=%s link=%s items=%d skipped=%d", interaction.user.id, link.url, sent, media.skipped)
+        return None
+
     async def _send_fallback(self, interaction: discord.Interaction, link: ReelLink, reason: str) -> None:
         content = (
             f"{link.embed_url(self.config.embed_fixer_domain)}\n"
-            f"-# Couldn't post the video ({reason}), so here's an embed link instead."
+            f"-# Couldn't upload it ({reason}), so here's an embed link instead."
         )
         try:
             await interaction.followup.send(content)
@@ -107,7 +152,7 @@ class ReelBot(discord.Client):
 def _register_commands(bot: ReelBot) -> None:
     tree = bot.tree
 
-    @tree.command(name="reel", description="Post an Instagram reel as a video")
+    @tree.command(name="reel", description="Post an Instagram reel, video or photo post")
     @app_commands.describe(link="Instagram reel or post URL")
     @installs
     @contexts

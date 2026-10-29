@@ -14,7 +14,7 @@ as_app() { runuser -u "$APP_USER" -- "$@"; }
 
 as_app git -C "$APP_DIR" pull --ff-only
 as_app "$APP_DIR/.venv/bin/pip" install --quiet --disable-pip-version-check -r "$APP_DIR/requirements.txt"
-as_app "$APP_DIR/.venv/bin/pip" install --quiet --disable-pip-version-check --upgrade yt-dlp
+as_app "$APP_DIR/.venv/bin/pip" install --quiet --disable-pip-version-check --upgrade yt-dlp gallery-dl
 
 install -m 644 "$APP_DIR/deploy/reelbot.service" "$APP_DIR/deploy/ytdlp-update.service" \
   "$APP_DIR/deploy/ytdlp-update.timer" /etc/systemd/system/

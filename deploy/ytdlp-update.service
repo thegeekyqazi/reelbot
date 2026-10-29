@@ -1,5 +1,5 @@
 [Unit]
-Description=Upgrade yt-dlp for reelbot and restart it
+Description=Upgrade yt-dlp and gallery-dl for reelbot, then restart it
 After=network-online.target
 Wants=network-online.target
 
@@ -7,6 +7,6 @@ Wants=network-online.target
 Type=oneshot
 User=reelbot
 Group=reelbot
-ExecStart=/opt/reelbot/.venv/bin/pip install --quiet --disable-pip-version-check --upgrade yt-dlp
+ExecStart=/opt/reelbot/.venv/bin/pip install --quiet --disable-pip-version-check --upgrade yt-dlp gallery-dl
 # "+" runs this step with full privileges so it can restart the bot.
 ExecStartPost=+/bin/systemctl try-restart reelbot.service

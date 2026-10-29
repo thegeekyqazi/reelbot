@@ -1,6 +1,6 @@
 # reelbot
 
-A Discord **user-installable app** that downloads Instagram reels and posts them as video files in any chat: DMs, **group DMs** (where normal bots can't be added), and servers.
+A Discord **user-installable app** that downloads Instagram reels, videos and photo posts (including carousels) and posts them as files in any chat: DMs, **group DMs** (where normal bots can't be added), and servers.
 
 You install it to your own Discord account ("Add to my apps"), so it goes wherever you go. It's private by default: only you and the people you add to the allowlist can use your copy.
 
@@ -8,9 +8,11 @@ You install it to your own Discord account ("Add to my apps"), so it goes wherev
 
 ## Features
 
-- `/reel link:<instagram url>` posts the reel as an mp4 that everyone in the chat can see.
-- **Right-click / long-press a message → Apps → Send reel** finds the first Instagram link in that message and posts the video.
-- Oversized videos are re-encoded with ffmpeg to fit Discord's upload limit.
+- `/reel link:<instagram url>` posts the reel as an mp4 that everyone in the chat can see. Photo posts are posted as images.
+- **Carousels**: every photo and video in the post is posted, in order. That's up to 10 attachments per message, split across messages when needed.
+- **Right-click / long-press a message → Apps → Send reel** finds the first Instagram link in that message and posts its media.
+- Oversized videos are re-encoded with ffmpeg to fit Discord's upload limit. Items that still don't fit are skipped, with a note.
+- Downloads use [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [gallery-dl](https://github.com/mikf/gallery-dl). `/p/` posts try gallery-dl first because they may contain photos. Reels try yt-dlp first. Each falls back to the other.
 - If a download or upload fails, the bot posts an embed-fixer link (default `instagramfix.com`) so the reel still plays inline.
 - Allowlist: strangers get an ephemeral "This bot is private." and nothing is downloaded.
 - Owner-only commands, always ephemeral:
@@ -114,7 +116,7 @@ The script is idempotent, so it's safe to re-run. It:
 3. creates the system user `reelbot` and clones the repo to `/opt/reelbot`
 4. creates a venv and installs the requirements
 5. creates `/opt/reelbot/.env` from `.env.example` if it's missing (`chmod 600`, owned by `reelbot`)
-6. installs and enables `reelbot.service` and `ytdlp-update.timer`, which runs `ytdlp-update.service` daily
+6. installs and enables `reelbot.service` and `ytdlp-update.timer`, which runs `ytdlp-update.service` daily to upgrade yt-dlp and gallery-dl
 
 Then fill in your settings and start the bot:
 
@@ -131,7 +133,7 @@ journalctl -u reelbot -f
 | Logs | `journalctl -u reelbot -f` |
 | Restart | `sudo systemctl restart reelbot` |
 | Update code | `sudo bash /opt/reelbot/deploy/update.sh` |
-| Upgrade yt-dlp now | `sudo systemctl start ytdlp-update.service` |
+| Upgrade yt-dlp + gallery-dl now | `sudo systemctl start ytdlp-update.service` |
 | Next auto-upgrade | `systemctl list-timers ytdlp-update.timer` |
 
 The service runs as the unprivileged `reelbot` user with systemd hardening: `ProtectSystem=strict`, with only `/opt/reelbot/data` and a private `/tmp` writable.
@@ -143,7 +145,7 @@ The service runs as the unprivileged `reelbot` user with systemd hardening: `Pro
 
 ## Instagram cookies
 
-Instagram often blocks anonymous downloads from cloud IPs. If downloads fail with a login or rate-limit message, give yt-dlp cookies from a logged-in session:
+Instagram often blocks anonymous downloads from cloud IPs, especially for photo posts. If downloads fail with a login or rate-limit message, give the bot cookies from a logged-in session. The same file is used by both yt-dlp and gallery-dl:
 
 1. Use a **throwaway Instagram account**, never your personal one. It may get flagged or banned.
 2. Log in to it in a browser and export cookies in **Netscape format** with a "cookies.txt" browser extension.
@@ -161,9 +163,11 @@ Cookie files are git-ignored. Never commit them.
 
 | Symptom | Fix |
 |---|---|
-| Every download fails, or fails suddenly after working | Instagram changed something. Upgrade yt-dlp: `sudo systemctl start ytdlp-update.service`. This also runs daily |
+| Every download fails, or fails suddenly after working | Instagram changed something. Upgrade the downloaders: `sudo systemctl start ytdlp-update.service`. This also runs daily |
+| Reels work but photo posts give embed links | Photo posts usually need cookies, so set `IG_COOKIES`. Also check gallery-dl is installed (`/opt/reelbot/.venv/bin/gallery-dl --version`) |
 | "Instagram wants a login" | Cookies are missing or expired. Re-export them (see [Instagram cookies](#instagram-cookies)) |
-| "too large" / embed link instead of video | The reel didn't fit under the upload limit even after compressing. Very long reels won't fit in 10 MB. The embed link still plays inline |
+| "too large" / embed link instead of video | Nothing in the post fit under the upload limit, even after compressing. Very long reels won't fit in 10 MB. The embed link still plays inline |
+| "N item(s) were too large to post" | Some carousel items didn't fit and were skipped. The note links to the full post |
 | Commands don't show up | Wait a few minutes after first start, then reload Discord (Ctrl+R). Check the logs for `Synced N global command(s)` |
 | "This bot is private." | Expected for anyone not on the allowlist. The owner runs `/allow user:@them` |
 | Bot won't start: `Missing or invalid configuration` | `DISCORD_TOKEN` or `OWNER_ID` isn't set in `.env` |
@@ -171,7 +175,6 @@ Cookie files are git-ignored. Never commit them.
 
 ## Limitations / out of scope
 
-- **Carousels**: only the first item is sent. If that item is a photo, you get the embed link.
 - Stories, private accounts, and other sites such as TikTok or YouTube aren't supported (yet).
 - No web dashboard or database. The allowlist is a JSON file.
 

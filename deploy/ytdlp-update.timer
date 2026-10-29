@@ -1,5 +1,5 @@
 [Unit]
-Description=Daily yt-dlp upgrade for reelbot
+Description=Daily yt-dlp and gallery-dl upgrade for reelbot
 
 [Timer]
 OnCalendar=daily
