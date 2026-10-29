@@ -1,0 +1,29 @@
+[Unit]
+Description=reelbot - Instagram reels to Discord
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=reelbot
+Group=reelbot
+WorkingDirectory=/opt/reelbot
+EnvironmentFile=/opt/reelbot/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/reelbot/.venv/bin/python -m reelbot
+Restart=always
+RestartSec=10
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/opt/reelbot/data /tmp
+
+[Install]
+WantedBy=multi-user.target

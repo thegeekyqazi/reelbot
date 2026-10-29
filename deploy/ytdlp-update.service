@@ -1,0 +1,12 @@
+[Unit]
+Description=Upgrade yt-dlp for reelbot and restart it
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=reelbot
+Group=reelbot
+ExecStart=/opt/reelbot/.venv/bin/pip install --quiet --disable-pip-version-check --upgrade yt-dlp
+# "+" runs this step with full privileges so it can restart the bot.
+ExecStartPost=+/bin/systemctl try-restart reelbot.service
