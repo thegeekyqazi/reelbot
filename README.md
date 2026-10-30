@@ -12,7 +12,7 @@ You install it to your own Discord account ("Add to my apps"), so it goes wherev
 - **Carousels**: every photo and video in the post is posted, in order. That's up to 10 attachments per message, split across messages when needed.
 - **Right-click / long-press a message → Apps → Send reel** finds the first Instagram link in that message and posts its media.
 - Oversized videos are re-encoded with ffmpeg to fit Discord's upload limit. Items that still don't fit are skipped, with a note.
-- Downloads use [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [gallery-dl](https://github.com/mikf/gallery-dl). `/p/` posts try gallery-dl first because they may contain photos. Reels try yt-dlp first. Each falls back to the other.
+- Downloads use [yt-dlp](https://github.com/yt-dlp/yt-dlp), which gets videos and photos without a login, with [gallery-dl](https://github.com/mikf/gallery-dl) as a fallback. When cookies are set, `/p/` posts try gallery-dl first.
 - If a download or upload fails, the bot posts an embed-fixer link (default `instagramfix.com`) so the reel still plays inline.
 - Allowlist: strangers get an ephemeral "This bot is private." and nothing is downloaded.
 - Owner-only commands, always ephemeral:
@@ -145,7 +145,7 @@ The service runs as the unprivileged `reelbot` user with systemd hardening: `Pro
 
 ## Instagram cookies
 
-Instagram often blocks anonymous downloads from cloud IPs, especially for photo posts. If downloads fail with a login or rate-limit message, give the bot cookies from a logged-in session. The same file is used by both yt-dlp and gallery-dl:
+Reels and photos usually download without a login, but Instagram often blocks anonymous downloads from cloud IPs. If downloads fail with a login or rate-limit message, give the bot cookies from a logged-in session. The same file is used by both yt-dlp and gallery-dl:
 
 1. Use a **throwaway Instagram account**, never your personal one. It may get flagged or banned.
 2. Log in to it in a browser and export cookies in **Netscape format** with a "cookies.txt" browser extension.
@@ -164,7 +164,7 @@ Cookie files are git-ignored. Never commit them.
 | Symptom | Fix |
 |---|---|
 | Every download fails, or fails suddenly after working | Instagram changed something. Upgrade the downloaders: `sudo systemctl start ytdlp-update.service`. This also runs daily |
-| Reels work but photo posts give embed links | Photo posts usually need cookies, so set `IG_COOKIES`. Also check gallery-dl is installed (`/opt/reelbot/.venv/bin/gallery-dl --version`) |
+| Reels work but photo posts give embed links | Update yt-dlp first (`sudo systemctl start ytdlp-update.service`). If that doesn't help, set `IG_COOKIES` so gallery-dl can log in |
 | "Instagram wants a login" | Cookies are missing or expired. Re-export them (see [Instagram cookies](#instagram-cookies)) |
 | "too large" / embed link instead of video | Nothing in the post fit under the upload limit, even after compressing. Very long reels won't fit in 10 MB. The embed link still plays inline |
 | "N item(s) were too large to post" | Some carousel items didn't fit and were skipped. The note links to the full post |

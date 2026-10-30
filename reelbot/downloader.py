@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import logging
+import re
 import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
 
@@ -52,6 +54,45 @@ def is_media(path: Path) -> bool:
     return path.suffix.lower() in VIDEO_EXTS | IMAGE_EXTS
 
 
+def _image_area(url: str) -> float | None:
+    """Pixel area encoded in an Instagram CDN URL's ``stp`` param; inf for the original, None if cropped.
+
+    ``stp`` looks like ``c0.40.1216.1216a_dst-jpg_e35_s1080x1080_tt6``: a ``c…`` token means a
+    square crop, ``s``/``p<W>x<H>`` a resize, and neither means the untouched original.
+    """
+    stp = parse_qs(urlparse(url).query).get("stp", [""])[0]
+    tokens = stp.split("_")
+    if any(re.fullmatch(r"c[\d.]+a?", t) for t in tokens):
+        return None
+    for t in tokens:
+        if m := re.fullmatch(r"[sp](\d+)x(\d+)", t):
+            return int(m[1]) * int(m[2])
+    return float("inf")
+
+
+def best_image_url(thumbnails: list[dict]) -> str | None:
+    """The largest uncropped image among yt-dlp's thumbnails for an Instagram photo."""
+    urls = [t["url"] for t in thumbnails if t.get("url")]
+    scored = [(area, url) for url in urls if (area := _image_area(url)) is not None]
+    if scored:
+        return max(scored, key=lambda s: s[0])[1]
+    return urls[-1] if urls else None
+
+
+def image_ext(data: bytes, url: str) -> str:
+    """File extension from the image's magic bytes; Instagram serves JPEGs under .heic URLs."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"\x89PNG"):
+        return ".png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data.startswith(b"GIF8"):
+        return ".gif"
+    ext = Path(urlparse(url).path).suffix.lower()
+    return ext if ext in IMAGE_EXTS else ".jpg"
+
+
 def _friendly_error(msg: str) -> DownloadError:
     msg = msg.lower()
     if any(hint in msg for hint in _LOGIN_HINTS):
@@ -88,7 +129,7 @@ class Downloader:
         if not self.has_ffmpeg:
             log.warning("ffmpeg/ffprobe not found; oversized videos can't be shrunk")
         if not self.has_gallery_dl:
-            log.warning("gallery-dl not installed; photo posts will fall back to embed links")
+            log.warning("gallery-dl not installed; only yt-dlp will be used")
 
     async def fetch(self, link: ReelLink, workdir: Path, limit_bytes: int) -> Media:
         """Download every photo/video in ``link`` into ``workdir``, each fitting ``limit_bytes``."""
@@ -115,11 +156,16 @@ class Downloader:
     async def _download_any(
         self, link: ReelLink, workdir: Path, threads: list[asyncio.Future]
     ) -> tuple[list[Path], list[str]]:
-        """Try each backend in turn. gallery-dl goes first for /p/ posts since they may hold photos."""
+        """Try each backend in turn.
+
+        yt-dlp handles photos too, without a login. gallery-dl only goes first for /p/ posts
+        when cookies are set, since anonymously Instagram sends it to the login page.
+        """
         backends = [("yt-dlp", self._ytdlp)]
         if self.has_gallery_dl:
             gallery = ("gallery-dl", self._gallery_dl)
-            backends = [gallery, *backends] if link.kind == "p" else [*backends, gallery]
+            first = link.kind == "p" and self.cookies
+            backends = [gallery, *backends] if first else [*backends, gallery]
 
         errors: list[DownloadError] = []
         for name, backend in backends:
@@ -162,15 +208,41 @@ class Downloader:
             "socket_timeout": 20,
             "retries": 2,
             "max_filesize": MAX_SOURCE_BYTES,
+            # Photos have no formats; resolve first, then download videos and save photos separately.
+            "ignore_no_formats_error": True,
         }
         if self.cookies:
             opts["cookiefile"] = str(self.cookies)
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.extract_info(url, download=True)
+                info = ydl.extract_info(url, download=False)
+                entries = info.get("entries") or [info]
+                for entry in list(entries)[:MAX_ITEMS]:
+                    if not entry:
+                        continue
+                    if entry.get("formats"):
+                        ydl.process_info(entry)
+                    else:
+                        self._save_photo(ydl, entry, outdir)
         except yt_dlp.utils.DownloadError as e:
             raise _friendly_error(str(e)) from e
         return self._collect(outdir)
+
+    @staticmethod
+    def _save_photo(ydl: yt_dlp.YoutubeDL, entry: dict, outdir: Path) -> None:
+        url = best_image_url(entry.get("thumbnails") or [])
+        if url is None:
+            return
+        try:
+            with ydl.urlopen(url) as resp:
+                data = resp.read(MAX_SOURCE_BYTES + 1)
+        except Exception as e:
+            raise yt_dlp.utils.DownloadError(f"photo download failed: {e}") from e
+        if len(data) > MAX_SOURCE_BYTES:
+            return
+        # Same naming as outtmpl so photos and videos sort into post order.
+        name = f"{entry.get('playlist_index') or 0:03}_{entry.get('id', 'photo')}"
+        (outdir / (name + image_ext(data, url))).write_bytes(data)
 
     async def _gallery_dl(self, url: str, outdir: Path, threads: list[asyncio.Future]) -> list[Path]:
         cmd = [

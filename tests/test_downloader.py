@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from reelbot.downloader import Downloader, DownloadError
+from reelbot.downloader import Downloader, DownloadError, best_image_url, image_ext
 from reelbot.links import ReelLink
 
 
@@ -52,12 +52,20 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def test_photo_posts_try_gallery_dl_first(tmp_path):
+def test_photo_posts_try_gallery_dl_first_with_cookies(tmp_path):
     order = []
     d = _downloader(order, {"gallery-dl": ["001_a.jpg", "002_b.mp4"], "yt-dlp": ["x.mp4"]})
+    d.cookies = Path("cookies.txt")
     media = run(d.fetch(ReelLink("p", "ABC"), tmp_path, 1000))
     assert order == ["gallery-dl"]
     assert [p.name for p in media.files] == ["001_a.jpg", "002_b.mp4"]
+
+
+def test_photo_posts_try_ytdlp_first_without_cookies(tmp_path):
+    order = []
+    d = _downloader(order, {"gallery-dl": ["001_a.jpg"], "yt-dlp": ["001_a.jpg"]})
+    run(d.fetch(ReelLink("p", "ABC"), tmp_path, 1000))
+    assert order == ["yt-dlp"]
 
 
 def test_reels_try_ytdlp_first_then_fall_back(tmp_path):
@@ -71,6 +79,7 @@ def test_reels_try_ytdlp_first_then_fall_back(tmp_path):
 def test_empty_result_falls_back(tmp_path):
     order = []
     d = _downloader(order, {"gallery-dl": [], "yt-dlp": ["0_a.mp4"]})
+    d.cookies = Path("cookies.txt")
     run(d.fetch(ReelLink("p", "ABC"), tmp_path, 1000))
     assert order == ["gallery-dl", "yt-dlp"]
 
@@ -112,3 +121,35 @@ def test_semaphore_released_after_fetch(tmp_path):
     d = _downloader([], {"gallery-dl": ["001_a.jpg"], "yt-dlp": []})
     run(d.fetch(ReelLink("p", "ABC"), tmp_path, 1000))
     assert not d._sem.locked() and d._sem._value == 2
+
+
+CDN = "https://scontent.cdninstagram.com/v/t51/1_n.jpg?stp="
+
+
+def test_best_image_prefers_uncropped_original():
+    thumbs = [
+        {"url": CDN + "c0.40.1216.1216a_dst-jpg_e35_s1080x1080_tt6"},
+        {"url": CDN + "dst-jpg_e35_p1080x1080_tt6"},
+        {"url": CDN + "dst-jpg_e35_tt6"},
+        {"url": CDN + "dst-jpg_e35_p240x240_tt6"},
+    ]
+    assert best_image_url(thumbs) == CDN + "dst-jpg_e35_tt6"
+
+
+def test_best_image_picks_largest_resize():
+    thumbs = [{"url": CDN + "dst-jpg_p480x480"}, {"url": CDN + "dst-jpg_p1080x1080"}, {"url": CDN + "dst-jpg_s640x640"}]
+    assert best_image_url(thumbs) == CDN + "dst-jpg_p1080x1080"
+
+
+def test_best_image_falls_back_to_last_when_all_cropped():
+    thumbs = [{"url": CDN + "c0.0.1.1a_s150x150"}, {"url": CDN + "c0.0.1.1a_s1080x1080"}]
+    assert best_image_url(thumbs) == CDN + "c0.0.1.1a_s1080x1080"
+    assert best_image_url([]) is None
+
+
+def test_image_ext_trusts_bytes_over_url():
+    assert image_ext(b"\xff\xd8\xff\xe0rest", "https://x/1_n.heic") == ".jpg"
+    assert image_ext(b"\x89PNG\r\n", "https://x/1_n.jpg") == ".png"
+    assert image_ext(b"RIFF\0\0\0\0WEBPVP8", "https://x/a") == ".webp"
+    assert image_ext(b"????", "https://x/1_n.heic") == ".heic"
+    assert image_ext(b"????", "https://x/noext") == ".jpg"
