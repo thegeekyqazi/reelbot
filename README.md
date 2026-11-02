@@ -11,7 +11,7 @@ You install it to your own Discord account ("Add to my apps"), so it goes wherev
 - `/reel link:<instagram url>` posts the reel as an mp4 that everyone in the chat can see. Photo posts are posted as images.
 - **Carousels**: every photo and video in the post is posted, in order. That's up to 10 attachments per message, split across messages when needed.
 - **Right-click / long-press a message → Apps → Send reel** finds the first Instagram link in that message and posts its media.
-- Oversized videos are re-encoded with ffmpeg to fit Discord's upload limit. Items that still don't fit are skipped, with a note.
+- Oversized videos: the bot first fetches one of Instagram's smaller renditions and remuxes it without re-encoding (H.264 as mp4, VP9 as WebM so it plays on iOS/iPadOS), which takes seconds. Only if none fits is the video re-encoded with ffmpeg, which can take minutes on an e2-micro. Items that still don't fit are skipped, with a note.
 - Downloads use [yt-dlp](https://github.com/yt-dlp/yt-dlp), which gets videos and photos without a login, with [gallery-dl](https://github.com/mikf/gallery-dl) as a fallback. When cookies are set, `/p/` posts try gallery-dl first.
 - If a download or upload fails, the bot posts an embed-fixer link (default `instagramfix.com`) so the reel still plays inline.
 - Allowlist: strangers get an ephemeral "This bot is private." and nothing is downloaded.

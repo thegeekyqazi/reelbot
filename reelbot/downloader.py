@@ -20,6 +20,7 @@ from .links import ReelLink
 log = logging.getLogger(__name__)
 
 AUDIO_KBPS = 96
+OPUS_KBPS = 64  # audio bitrate when remuxing a VP9 rendition into WebM
 TARGET_FRACTION = 0.9  # aim for 90% of the upload limit to leave container overhead
 MIN_VIDEO_KBPS = 100  # below this the result is unwatchable, so give up instead
 MAX_SOURCE_BYTES = 300 * 1024 * 1024  # refuse absurdly large sources outright
@@ -80,31 +81,51 @@ def best_image_url(thumbnails: list[dict]) -> str | None:
     return urls[-1] if urls else None
 
 
-def _is_h264(vcodec: str | None) -> bool:
-    return bool(vcodec) and vcodec.lower().startswith(("avc1", "avc3", "h264"))
+def _video_container(vcodec: str | None) -> str | None:
+    """Container a DASH video stream is sent in, or None if it shouldn't be used.
+
+    Apple's player (Discord on iOS/iPadOS) shows a frozen frame for VP9 in mp4 but plays
+    VP9 in WebM, so VP9 goes to WebM (with the audio re-encoded to Opus) and H.264 to mp4.
+    """
+    codec = (vcodec or "").lower()
+    if codec.startswith(("avc1", "avc3", "h264")):
+        return "mp4"
+    if codec.startswith(("vp09", "vp9")):
+        return "webm"
+    return None
 
 
-def pick_smaller_formats(formats: list[dict], duration: float | None, limit_bytes: int) -> str | None:
-    """A ``video+audio`` format spec from separate streams that fits ``limit_bytes``, or None.
+@dataclass
+class Rendition:
+    video_id: str
+    audio_id: str
+    container: str  # "mp4" or "webm"
+
+
+def pick_smaller_formats(formats: list[dict], duration: float | None, limit_bytes: int) -> Rendition | None:
+    """The best separate video+audio pair that fits ``limit_bytes``, or None.
 
     Instagram serves lower-bitrate DASH renditions next to the full progressive mp4, so an
-    oversized reel can usually be fetched smaller and merged without re-encoding.
+    oversized reel can usually be fetched smaller and remuxed without re-encoding the video.
     """
     if not duration or duration <= 0:
         return None
     audios = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")]
-    # H.264 only: Apple's player (Discord on iOS/iPadOS) shows a frozen frame for VP9 in mp4.
-    videos = [f for f in formats if f.get("acodec") == "none" and _is_h264(f.get("vcodec")) and f.get("tbr")]
+    videos = [
+        f for f in formats
+        if f.get("acodec") == "none" and _video_container(f.get("vcodec")) and f.get("tbr")
+    ]
     if not audios or not videos:
         return None
     audio = max(audios, key=lambda f: f.get("tbr") or f.get("abr") or 0)
-    audio_kbps = audio.get("tbr") or audio.get("abr") or AUDIO_KBPS
+    audio_kbps = max(audio.get("tbr") or audio.get("abr") or 0, OPUS_KBPS)
     budget_kbps = limit_bytes * TARGET_FRACTION * 8 / duration / 1000 - audio_kbps
     fitting = [f for f in videos if f["tbr"] <= budget_kbps]
     if not fitting:
         return None
-    video = max(fitting, key=lambda f: f["tbr"])
-    return f"{video['format_id']}+{audio['format_id']}"
+    # Highest bitrate wins; on a tie prefer H.264, which needs no audio re-encode.
+    video = max(fitting, key=lambda f: (f["tbr"], _video_container(f["vcodec"]) == "mp4"))
+    return Rendition(video["format_id"], audio["format_id"], _video_container(video["vcodec"]))
 
 
 def _probe_duration_sync(path: Path) -> float | None:
@@ -271,7 +292,7 @@ class Downloader:
         return self._collect(outdir)
 
     def _refetch_smaller(self, opts: dict, path: str, entry: dict, limit_bytes: int) -> None:
-        """Swap an oversized video for a smaller Instagram rendition, merged without re-encoding.
+        """Swap an oversized video for a smaller Instagram rendition, without re-encoding the video.
 
         Leaves the original in place if nothing fits, so ``_fit_all`` can still re-encode it.
         """
@@ -280,27 +301,38 @@ class Downloader:
             return
         # yt-dlp often has no duration for Instagram; the downloaded file always does.
         duration = entry.get("duration") or _probe_duration_sync(original)
-        spec = pick_smaller_formats(entry["formats"], duration, limit_bytes)
-        if spec is None:
+        rendition = pick_smaller_formats(entry["formats"], duration, limit_bytes)
+        if rendition is None:
             return
-        smaller = original.with_name(original.stem + ".small.%(ext)s")
-        small_opts = {**opts, "format": spec, "merge_output_format": "mp4", "outtmpl": str(smaller)}
+        stem = original.stem + ".small"
+        streams = original.with_name(stem + ".%(format_id)s.%(ext)s")
+        stream_opts = {**opts, "format": f"{rendition.video_id},{rendition.audio_id}", "outtmpl": str(streams)}
+        merged = original.with_name(f"{stem}.{rendition.container}")
         try:
-            with yt_dlp.YoutubeDL(small_opts) as ydl:
+            with yt_dlp.YoutubeDL(stream_opts) as ydl:
                 ydl.process_ie_result(dict(entry), download=True)
-        except yt_dlp.utils.DownloadError as e:
+            video = next(original.parent.glob(f"{stem}.{rendition.video_id}.*"))
+            audio = next(original.parent.glob(f"{stem}.{rendition.audio_id}.*"))
+            audio_args = ["-c:a", "copy"] if rendition.container == "mp4" else ["-c:a", "libopus", "-b:a", f"{OPUS_KBPS}k"]
+            subprocess.run(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
+                 "-i", str(video), "-i", str(audio), "-map", "0:v:0", "-map", "1:a:0",
+                 "-c:v", "copy", *audio_args, "-movflags", "+faststart", str(merged)],
+                check=True, capture_output=True, timeout=FFMPEG_TIMEOUT,
+            )
+        except (yt_dlp.utils.DownloadError, StopIteration, OSError, subprocess.SubprocessError) as e:
             log.info("Smaller rendition failed for %s: %s", entry.get("id"), e)
         else:
-            merged = original.with_name(original.stem + ".small.mp4")
-            if merged.is_file() and merged.stat().st_size <= limit_bytes:
+            if merged.stat().st_size <= limit_bytes:
                 log.info(
-                    "Using %s for %s (%.1f MB instead of %.1f MB)",
-                    spec, entry.get("id"), merged.stat().st_size / 2**20, original.stat().st_size / 2**20,
+                    "Using %s+%s (%s) for %s (%.1f MB instead of %.1f MB)",
+                    rendition.video_id, rendition.audio_id, rendition.container, entry.get("id"),
+                    merged.stat().st_size / 2**20, original.stat().st_size / 2**20,
                 )
                 original.unlink()
-                merged.rename(original.with_suffix(".mp4"))
-        # Drop leftovers (unmerged streams, a still-too-big merge) so they aren't posted.
-        for leftover in original.parent.glob(original.stem + ".small*"):
+                merged.rename(original.with_suffix(f".{rendition.container}"))
+        # Drop leftovers (separate streams, a still-too-big merge) so they aren't posted.
+        for leftover in original.parent.glob(stem + "*"):
             leftover.unlink(missing_ok=True)
 
     @staticmethod

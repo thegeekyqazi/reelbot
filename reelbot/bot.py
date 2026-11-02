@@ -36,13 +36,18 @@ def plan_batches(sizes: list[int], limit: int, max_files: int = MAX_FILES_PER_ME
     return batches
 
 
+def _video_ext(path: Path) -> str:
+    # WebM must keep its extension: it holds VP9, which Apple's player won't play from an .mp4.
+    return ".webm" if path.suffix.lower() == ".webm" else ".mp4"
+
+
 def attachment_names(paths: list[Path]) -> list[str]:
-    """``reel.mp4`` for a lone video, otherwise numbered names that keep post order."""
+    """``reel.mp4`` (or ``reel.webm``) for a lone video, otherwise numbered names that keep post order."""
     if len(paths) == 1 and is_video(paths[0]):
-        return ["reel.mp4"]
+        return [f"reel{_video_ext(paths[0])}"]
     names = []
     for i, p in enumerate(paths, 1):
-        ext = ".mp4" if is_video(p) else p.suffix.lower().replace(".jpeg", ".jpg")
+        ext = _video_ext(p) if is_video(p) else p.suffix.lower().replace(".jpeg", ".jpg")
         names.append(f"{i:02}{ext}")
     return names
 

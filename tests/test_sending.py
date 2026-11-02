@@ -28,3 +28,8 @@ def test_carousel_names_keep_order_and_type():
 
 def test_lone_photo_keeps_extension():
     assert attachment_names([Path("001_a.jpg")]) == ["01.jpg"]
+
+
+def test_webm_keeps_its_extension():
+    assert attachment_names([Path("0_abc.webm")]) == ["reel.webm"]
+    assert attachment_names([Path("001_a.jpg"), Path("002_b.webm")]) == ["01.jpg", "02.webm"]

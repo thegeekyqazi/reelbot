@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from reelbot.downloader import Downloader, DownloadError, best_image_url, image_ext, pick_smaller_formats
+from reelbot.downloader import Downloader, DownloadError, best_image_url, image_ext, pick_smaller_formats, Rendition
 from reelbot.links import ReelLink
 
 
@@ -168,12 +168,28 @@ IG_FORMATS = [
 
 
 def test_smaller_formats_picks_best_video_that_fits():
-    # 18 MB over 64 s leaves ~2.1 Mbps, so 1561k fits and 2902k doesn't.
-    assert pick_smaller_formats(IG_FORMATS, 64, 18 * 2**20) == "dash-720mid+dash-a"
+    # 18 MB over 64 s leaves ~2 Mbps: the 1700k VP9 beats the 1561k H.264, and 2902k doesn't fit.
+    assert pick_smaller_formats(IG_FORMATS, 64, 18 * 2**20) == Rendition("dash-vp9", "dash-a", "webm")
+
+
+def test_smaller_formats_h264_goes_in_mp4():
+    h264_only = [f for f in IG_FORMATS if f["format_id"] != "dash-vp9"]
+    assert pick_smaller_formats(h264_only, 64, 18 * 2**20) == Rendition("dash-720mid", "dash-a", "mp4")
 
 
 def test_smaller_formats_drops_quality_for_tight_limits():
-    assert pick_smaller_formats(IG_FORMATS, 64, 10 * 2**20) == "dash-720lo+dash-a"
+    assert pick_smaller_formats(IG_FORMATS, 64, 10 * 2**20) == Rendition("dash-720lo", "dash-a", "mp4")
+
+
+def test_smaller_formats_prefers_h264_on_a_tie():
+    tie = IG_FORMATS + [{"format_id": "dash-avc-1700", "vcodec": "avc1.64001f", "acodec": "none", "tbr": 1700}]
+    assert pick_smaller_formats(tie, 64, 18 * 2**20).video_id == "dash-avc-1700"
+
+
+def test_smaller_formats_ignores_unknown_codecs():
+    av1 = [f for f in IG_FORMATS if f["format_id"] == "dash-a"]
+    av1.append({"format_id": "dash-av1", "vcodec": "av01.0.08M.08", "acodec": "none", "tbr": 500})
+    assert pick_smaller_formats(av1, 64, 18 * 2**20) is None
 
 
 def test_smaller_formats_none_when_nothing_fits_or_unknown():
@@ -181,8 +197,3 @@ def test_smaller_formats_none_when_nothing_fits_or_unknown():
     assert pick_smaller_formats(IG_FORMATS, None, 18 * 2**20) is None
     progressive_only = [f for f in IG_FORMATS if not f["format_id"].startswith("dash")]
     assert pick_smaller_formats(progressive_only, 64, 18 * 2**20) is None
-
-
-def test_smaller_formats_skips_vp9():
-    vp9_only = [f for f in IG_FORMATS if not (f["vcodec"] or "").startswith("avc1")]
-    assert pick_smaller_formats(vp9_only, 64, 18 * 2**20) is None
