@@ -54,9 +54,18 @@ def test_invalid_values(key, value):
         load_config({**BASE, key: value})
 
 
-def test_proxy_validated_without_leaking_it():
-    env = {**BASE, "IG_PROXY": "socks5h://user:secret@host:1080"}
-    assert load_config(env).ig_proxy == "socks5h://user:secret@host:1080"
+def test_proxies_accept_urls_and_webshare_format():
+    env = {**BASE, "IG_PROXY": "socks5h://u:p@h:1080, 1.2.3.4:6540:user:pw ,5.6.7.8:80"}
+    assert load_config(env).ig_proxies == (
+        "socks5h://u:p@h:1080",
+        "http://user:pw@1.2.3.4:6540",
+        "http://5.6.7.8:80",
+    )
+    assert load_config(BASE).ig_proxies == ()
+
+
+def test_bad_proxy_rejected_without_leaking_it():
     with pytest.raises(ConfigError) as exc:
-        load_config({**BASE, "IG_PROXY": "user:secret@host:1080"})
+        load_config({**BASE, "IG_PROXY": "http://ok:1, user@secret-host"})
+    assert "entry 2" in str(exc.value)
     assert "secret" not in str(exc.value)

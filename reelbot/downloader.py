@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from typing import Callable
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -34,6 +35,19 @@ _LOGIN_HINTS = ("login", "log in", "cookies", "401", "403")
 
 class DownloadError(Exception):
     """A failure with a short, user-safe reason as its message."""
+
+
+Progress = Callable[[str], None]  # receives short, user-facing status lines; must not block
+
+
+def _no_progress(_: str) -> None:
+    pass
+
+
+# Errors about the post itself: another proxy won't change them.
+_FINAL_ERRORS = ("the post is private", "no video in that post")
+PROXY_ROUND_SECONDS = 150  # give up on proxies after this long, even if some are untried
+PROXY_SOCKET_TIMEOUT = 10  # dead proxies should fail fast
 
 
 class RateLimited(DownloadError):
@@ -190,10 +204,16 @@ class _YtdlpLogger:
 
 class Downloader:
     def __init__(
-        self, cookies: Path | None = None, max_concurrent: int = 2, timeout: float = 90, proxy: str | None = None
+        self,
+        cookies: Path | None = None,
+        max_concurrent: int = 2,
+        timeout: float = 90,
+        proxies: list[str] | tuple[str, ...] = (),
     ) -> None:
         self.cookies = cookies
-        self.proxy = proxy  # only used to retry after a rate limit, to save proxy bandwidth
+        # Only used to retry after a rate limit, to save proxy bandwidth.
+        self.proxies = list(proxies)
+        self._next_proxy = 0  # round-robin start, so one proxy doesn't take every retry
         self.timeout = timeout
         self._sem = asyncio.Semaphore(max_concurrent)
         self.has_ffmpeg = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
@@ -203,13 +223,17 @@ class Downloader:
         if not self.has_gallery_dl:
             log.warning("gallery-dl not installed; only yt-dlp will be used")
 
-    async def fetch(self, link: ReelLink, workdir: Path, limit_bytes: int) -> Media:
+    async def fetch(
+        self, link: ReelLink, workdir: Path, limit_bytes: int, progress: Progress = _no_progress
+    ) -> Media:
         """Download every photo/video in ``link`` into ``workdir``, each fitting ``limit_bytes``."""
+        if self._sem.locked():
+            progress("Waiting for another download to finish…")
         await self._sem.acquire()
         threads: list[asyncio.Future] = []
         try:
-            files, errors = await self._download_any(link, workdir, threads, limit_bytes)
-            media = await self._fit_all(files, workdir, limit_bytes)
+            files, errors = await self._download_any(link, workdir, threads, limit_bytes, progress)
+            media = await self._fit_all(files, workdir, limit_bytes, progress)
             media.errors = errors
             return media
         finally:
@@ -226,7 +250,12 @@ class Downloader:
         self._sem.release()
 
     async def _download_any(
-        self, link: ReelLink, workdir: Path, threads: list[asyncio.Future], limit_bytes: int
+        self,
+        link: ReelLink,
+        workdir: Path,
+        threads: list[asyncio.Future],
+        limit_bytes: int,
+        progress: Progress = _no_progress,
     ) -> tuple[list[Path], list[str]]:
         """Try each backend in turn.
 
@@ -240,17 +269,19 @@ class Downloader:
             backends = [gallery, *backends] if first else [*backends, gallery]
 
         errors: list[DownloadError] = []
-        for name, backend in backends:
+        for n, (name, backend) in enumerate(backends):
             outdir = workdir / name
             outdir.mkdir()
+            if n:
+                progress(f"First try failed ({errors[-1]}), trying another downloader…")
             try:
                 files = await backend(link.url, outdir, threads, limit_bytes)
             except RateLimited as e:
                 # Every backend shares this IP, so trying the next one only makes the user wait.
                 log.info("%s failed for %s: %s", name, link.url, e)
-                if not self.proxy:
+                if not self.proxies:
                     raise
-                return await self._via_proxy(link, workdir, threads, limit_bytes), [str(e)]
+                return await self._via_proxies(link, workdir, threads, limit_bytes, progress), [str(e)]
             except DownloadError as e:
                 log.info("%s failed for %s: %s", name, link.url, e)
                 errors.append(e)
@@ -263,20 +294,44 @@ class Downloader:
         generic = "couldn't download that post"
         raise next((e for e in errors if str(e) != generic), errors[0])
 
-    async def _via_proxy(
-        self, link: ReelLink, workdir: Path, threads: list[asyncio.Future], limit_bytes: int
+    async def _via_proxies(
+        self,
+        link: ReelLink,
+        workdir: Path,
+        threads: list[asyncio.Future],
+        limit_bytes: int,
+        progress: Progress,
     ) -> list[Path]:
-        outdir = workdir / "yt-dlp-proxy"
-        outdir.mkdir()
-        try:
-            files = await self._ytdlp(link.url, outdir, threads, limit_bytes, proxy=self.proxy)
-        except DownloadError as e:
-            log.info("yt-dlp via proxy failed for %s: %s", link.url, e)
-            raise
-        if not files:
-            raise DownloadError("nothing downloadable in that post")
-        log.info("yt-dlp via proxy got %d item(s) from %s", len(files), link.url)
-        return files
+        """Retry yt-dlp through each proxy in turn until one works or time runs out."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + PROXY_ROUND_SECONDS
+        total = len(self.proxies)
+        last: DownloadError = RateLimited("Instagram is rate-limiting the bot, try again later")
+        for attempt in range(1, total + 1):
+            if loop.time() >= deadline:
+                log.info("Giving up on proxies for %s after %d attempt(s)", link.url, attempt - 1)
+                break
+            index = self._next_proxy % total
+            self._next_proxy += 1
+            progress(f"Instagram is rate-limiting the bot. Retrying through proxy {attempt}/{total}…")
+            outdir = workdir / f"proxy-{attempt}"
+            outdir.mkdir()
+            # Log the proxy's position only: the URL carries its password.
+            try:
+                files = await self._ytdlp(link.url, outdir, threads, limit_bytes, proxy=self.proxies[index])
+            except DownloadError as e:
+                log.info("yt-dlp via proxy #%d failed for %s: %s", index + 1, link.url, e)
+                if str(e) in _FINAL_ERRORS:
+                    raise
+                last = e
+                continue
+            if files:
+                log.info("yt-dlp via proxy #%d got %d item(s) from %s", index + 1, len(files), link.url)
+                return files
+            last = DownloadError("nothing downloadable in that post")
+        if isinstance(last, RateLimited) or str(last) == "download timed out":
+            raise RateLimited("Instagram is rate-limiting the bot and every proxy, try again later")
+        raise last
 
     async def _ytdlp(
         self, url: str, outdir: Path, threads: list[asyncio.Future], limit_bytes: int, proxy: str | None = None
@@ -310,6 +365,7 @@ class Downloader:
             opts["cookiefile"] = str(self.cookies)
         if proxy:
             opts["proxy"] = proxy
+            opts["socket_timeout"] = PROXY_SOCKET_TIMEOUT
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -415,13 +471,16 @@ class Downloader:
     def _collect(outdir: Path) -> list[Path]:
         return sorted(p for p in outdir.iterdir() if p.is_file() and is_media(p))
 
-    async def _fit_all(self, files: list[Path], workdir: Path, limit_bytes: int) -> Media:
+    async def _fit_all(
+        self, files: list[Path], workdir: Path, limit_bytes: int, progress: Progress = _no_progress
+    ) -> Media:
         kept: list[Path] = []
         skipped = 0
         for i, path in enumerate(files[:MAX_ITEMS]):
             if path.stat().st_size <= limit_bytes:
                 kept.append(path)
             elif is_video(path) and self.has_ffmpeg:
+                progress("The video is too big for Discord. Compressing it, this can take a few minutes…")
                 try:
                     kept.append(await self._shrink(path, workdir / f"shrunk_{i:03}.mp4", limit_bytes))
                 except DownloadError as e:

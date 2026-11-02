@@ -23,7 +23,7 @@ class Config:
     embed_fixer_domain: str = "instagramfix.com"
     data_dir: Path = Path("./data")
     max_concurrent_downloads: int = 2
-    ig_proxy: str | None = None
+    ig_proxies: tuple[str, ...] = ()
 
     @property
     def max_upload_bytes(self) -> int:
@@ -51,6 +51,25 @@ def _bool(value: str, name: str) -> bool:
     if v in ("1", "true", "yes", "on"):
         return True
     raise ConfigError(f"{name} must be true or false, got {value!r}")
+
+
+_PROXY_SCHEMES = ("http://", "https://", "socks5://", "socks5h://")
+
+
+def _proxy_url(value: str, n: int) -> str:
+    """Accept a proxy URL, or Webshare's ``host:port:user:pass`` / ``host:port`` list format."""
+    if value.startswith(_PROXY_SCHEMES):
+        return value
+    parts = value.split(":")
+    if len(parts) == 4 and parts[1].isdigit():
+        host, port, user, password = parts
+        return f"http://{user}:{password}@{host}:{port}"
+    if len(parts) == 2 and parts[1].isdigit():
+        return f"http://{value}"
+    # Don't echo the value: proxy entries usually contain a password.
+    raise ConfigError(
+        f"IG_PROXY entry {n} isn't a proxy URL (http://, https://, socks5://, socks5h://) or host:port:user:pass"
+    )
 
 
 def load_config(env: Mapping[str, str] | None = None) -> Config:
@@ -85,10 +104,11 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     if cookies is not None and not cookies.is_file():
         raise ConfigError(f"IG_COOKIES points to {cookies}, which does not exist")
 
-    proxy = _get(env, "IG_PROXY") or None
-    if proxy and not proxy.startswith(("http://", "https://", "socks5://", "socks5h://")):
-        # Don't echo the value: proxy URLs often contain a password.
-        raise ConfigError("IG_PROXY must start with http://, https://, socks5:// or socks5h://")
+    proxies = tuple(
+        _proxy_url(part.strip(), n)
+        for n, part in enumerate(_get(env, "IG_PROXY").split(","), 1)
+        if part.strip()
+    )
 
     try:
         max_mb = float(_get(env, "MAX_UPLOAD_MB") or 10)
@@ -110,5 +130,5 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         embed_fixer_domain=_get(env, "EMBED_FIXER_DOMAIN") or "instagramfix.com",
         data_dir=Path(_get(env, "DATA_DIR") or "./data"),
         max_concurrent_downloads=concurrency,
-        ig_proxy=proxy,
+        ig_proxies=proxies,
     )

@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from reelbot.bot import attachment_names, plan_batches
+import asyncio
+
+from reelbot.bot import StatusMessage, attachment_names, plan_batches
 
 
 def test_single_batch():
@@ -33,3 +35,24 @@ def test_lone_photo_keeps_extension():
 def test_webm_keeps_its_extension():
     assert attachment_names([Path("0_abc.webm")]) == ["reel.webm"]
     assert attachment_names([Path("001_a.jpg"), Path("002_b.webm")]) == ["01.jpg", "02.webm"]
+
+
+def test_status_sends_latest_line_and_stops_after_close():
+    edits = []
+
+    async def main():
+        async def edit(content):
+            await asyncio.sleep(0.01)
+            edits.append(content)
+
+        status = StatusMessage(edit)
+        status.update("one")
+        status.update("two")  # replaces "one" before it's sent
+        await asyncio.sleep(0.05)
+        status.update("three")  # still pending at close: dropped, the reply replaces it anyway
+        await status.close()
+        status.update("late")
+        await asyncio.sleep(0.03)
+
+    asyncio.run(main())
+    assert edits == ["-# ⏳ two"]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import tempfile
 from pathlib import Path
@@ -34,6 +35,47 @@ def plan_batches(sizes: list[int], limit: int, max_files: int = MAX_FILES_PER_ME
         batches[-1].append(i)
         total += size
     return batches
+
+
+class StatusMessage:
+    """Shows progress in the deferred "thinking" message, without ever blocking the download.
+
+    Edits run in a background task and only the newest line is sent, so a burst of updates
+    can't pile up behind Discord's rate limits. ``close`` waits for the last edit so the
+    final reply can't be overwritten by a late status line.
+    """
+
+    def __init__(self, edit) -> None:
+        self._edit = edit  # async callable(content: str)
+        self._pending: str | None = None
+        self._shown: str | None = None
+        self._task: asyncio.Task | None = None
+        self._closed = False
+
+    def update(self, text: str) -> None:
+        if self._closed:
+            return
+        self._pending = text
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        while self._pending != self._shown and not self._closed:
+            text = self._pending
+            try:
+                await self._edit(f"-# ⏳ {text}")
+            except discord.HTTPException as e:
+                log.info("status edit failed: %s", e)
+                return
+            self._shown = text
+
+    async def close(self) -> None:
+        self._closed = True
+        if self._task is not None:
+            try:
+                await asyncio.wait_for(self._task, 10)
+            except (asyncio.TimeoutError, Exception):
+                pass
 
 
 def _video_ext(path: Path) -> str:
@@ -71,7 +113,7 @@ class ReelBot(discord.Client):
         self.downloader = Downloader(
             cookies=config.ig_cookies,
             max_concurrent=config.max_concurrent_downloads,
-            proxy=config.ig_proxy,
+            proxies=config.ig_proxies,
         )
         _register_commands(self)
 
@@ -106,16 +148,19 @@ class ReelBot(discord.Client):
         if interaction_limit:
             limit = min(limit, interaction_limit)
 
+        status = StatusMessage(lambda content: interaction.edit_original_response(content=content))
         with tempfile.TemporaryDirectory(prefix="reelbot-", ignore_cleanup_errors=True) as tmp:
+            reason: str | None = None
             try:
-                media = await self.downloader.fetch(link, Path(tmp), limit)
+                media = await self.downloader.fetch(link, Path(tmp), limit, status.update)
             except DownloadError as e:
                 reason = str(e)
                 log.warning("failed user=%s link=%s reason=%s", user_id, link.url, reason)
             except Exception:
                 reason = "something went wrong"
                 log.exception("error user=%s link=%s", user_id, link.url)
-            else:
+            await status.close()
+            if reason is None:
                 reason = await self._send_media(interaction, link, media, limit)
                 if reason is None:
                     return
@@ -125,7 +170,11 @@ class ReelBot(discord.Client):
     async def _send_media(
         self, interaction: discord.Interaction, link: ReelLink, media: Media, limit: int
     ) -> str | None:
-        """Upload the files in as few messages as possible. Returns a failure reason, or None."""
+        """Upload the files in as few messages as possible. Returns a failure reason, or None.
+
+        The first batch replaces the "thinking" message (and any status line in it); the rest
+        are follow-ups.
+        """
         names = attachment_names(media.files)
         batches = plan_batches([p.stat().st_size for p in media.files], limit)
         sent = 0
@@ -135,7 +184,10 @@ class ReelBot(discord.Client):
                 content = f"-# {media.skipped} item(s) were too large to post. Full post: <{link.url}>"
             files = [discord.File(media.files[i], filename=names[i]) for i in batch]
             try:
-                await interaction.followup.send(content=content, files=files)
+                if n == 0:
+                    await interaction.edit_original_response(content=content, attachments=files)
+                else:
+                    await interaction.followup.send(content=content, files=files)
             except discord.HTTPException as e:
                 log.warning("upload-failed user=%s link=%s status=%s code=%s", interaction.user.id, link.url, e.status, e.code)
                 if sent == 0:
@@ -151,7 +203,7 @@ class ReelBot(discord.Client):
             f"-# Couldn't upload it ({reason}), so here's an embed link instead."
         )
         try:
-            await interaction.followup.send(content)
+            await interaction.edit_original_response(content=content, attachments=[])
         except discord.HTTPException:
             log.exception("fallback-failed link=%s", link.url)
 

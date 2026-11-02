@@ -36,7 +36,7 @@ def _downloader(order: list[str], results: dict) -> Downloader:
 
     def fake(name):
         async def backend(url, outdir, threads, limit_bytes, proxy=None):
-            key = name + ("+proxy" if proxy else "")
+            key = name + (f"+{proxy}" if proxy else "")
             order.append(key)
             result = results[key]
             if isinstance(result, Exception):
@@ -102,21 +102,55 @@ def test_rate_limit_skips_other_backends(tmp_path):
     assert order == ["yt-dlp"]
 
 
-def test_rate_limit_retries_through_proxy(tmp_path):
-    order = []
-    d = _downloader(order, {"yt-dlp": RateLimited("slow down"), "yt-dlp+proxy": ["0_a.mp4"], "gallery-dl": []})
-    d.proxy = "http://proxy:8080"
-    media = run(d.fetch(ReelLink("reel", "ABC"), tmp_path, 1000))
-    assert order == ["yt-dlp", "yt-dlp+proxy"]
+def test_rate_limit_retries_through_each_proxy(tmp_path):
+    order, seen = [], []
+    d = _downloader(order, {
+        "yt-dlp": RateLimited("slow down"),
+        "yt-dlp+p1": RateLimited("slow down"),
+        "yt-dlp+p2": DownloadError("download timed out"),
+        "yt-dlp+p3": ["0_a.mp4"],
+        "gallery-dl": [],
+    })
+    d.proxies = ["p1", "p2", "p3"]
+    media = run(d.fetch(ReelLink("reel", "ABC"), tmp_path, 1000, seen.append))
+    assert order == ["yt-dlp", "yt-dlp+p1", "yt-dlp+p2", "yt-dlp+p3"]
     assert [p.name for p in media.files] == ["0_a.mp4"]
+    assert seen[-1].endswith("proxy 3/3…")
+
+
+def test_proxies_rotate_between_requests(tmp_path):
+    order = []
+    d = _downloader(order, {"yt-dlp": RateLimited("x"), "yt-dlp+p1": ["0_a.mp4"], "yt-dlp+p2": ["0_a.mp4"]})
+    d.proxies = ["p1", "p2"]
+    for name in ("A", "B"):
+        (tmp_path / name).mkdir()
+        run(d.fetch(ReelLink("reel", name), tmp_path / name, 1000))
+    assert order == ["yt-dlp", "yt-dlp+p1", "yt-dlp", "yt-dlp+p2"]
+
+
+def test_all_proxies_rate_limited(tmp_path):
+    d = _downloader([], {"yt-dlp": RateLimited("x"), "yt-dlp+p1": RateLimited("x"), "yt-dlp+p2": RateLimited("x")})
+    d.proxies = ["p1", "p2"]
+    with pytest.raises(RateLimited, match="every proxy"):
+        run(d.fetch(ReelLink("reel", "ABC"), tmp_path, 1000))
+
+
+def test_private_post_stops_proxy_retries(tmp_path):
+    order = []
+    d = _downloader(order, {"yt-dlp": RateLimited("x"), "yt-dlp+p1": DownloadError("the post is private")})
+    d.proxies = ["p1", "p2"]
+    with pytest.raises(DownloadError, match="private"):
+        run(d.fetch(ReelLink("reel", "ABC"), tmp_path, 1000))
+    assert order == ["yt-dlp", "yt-dlp+p1"]
 
 
 def test_proxy_unused_without_rate_limit(tmp_path):
-    order = []
+    order, seen = [], []
     d = _downloader(order, {"yt-dlp": DownloadError("couldn't download that post"), "gallery-dl": ["001_a.mp4"]})
-    d.proxy = "http://proxy:8080"
-    run(d.fetch(ReelLink("reel", "ABC"), tmp_path, 1000))
+    d.proxies = ["p1"]
+    run(d.fetch(ReelLink("reel", "ABC"), tmp_path, 1000, seen.append))
     assert order == ["yt-dlp", "gallery-dl"]
+    assert seen == ["First try failed (couldn't download that post), trying another downloader…"]
 
 
 def test_429_is_rate_limit_not_login():

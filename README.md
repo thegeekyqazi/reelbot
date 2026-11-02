@@ -52,7 +52,7 @@ All settings are environment variables. They're read from `.env` in the working 
 | `ALLOWED_USER_IDS` | no | | Comma-separated IDs that seed the allowlist on first run |
 | `ALLOW_EVERYONE` | no | `false` | `true` disables the allowlist |
 | `IG_COOKIES` | no | | Path to a Netscape-format Instagram `cookies.txt` |
-| `IG_PROXY` | no | | Proxy URL (`http://`, `https://`, `socks5://`, `socks5h://`). Only used to retry yt-dlp after Instagram rate-limits the server, so it costs little bandwidth |
+| `IG_PROXY` | no | | Comma-separated proxies: URLs (`http://`, `https://`, `socks5://`, `socks5h://`) or `host:port:user:pass`. Only used after Instagram rate-limits the server, trying each in turn (up to 150 s), so they cost little bandwidth |
 | `MAX_UPLOAD_MB` | no | `10` | Upload limit. The bot also respects the smaller limit Discord reports per interaction |
 | `EMBED_FIXER_DOMAIN` | no | `instagramfix.com` | Domain for the fallback link. Swap it if that service goes down |
 | `DATA_DIR` | no | `./data` | Holds `allowlist.json` |
