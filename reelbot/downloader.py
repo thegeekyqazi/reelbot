@@ -80,6 +80,10 @@ def best_image_url(thumbnails: list[dict]) -> str | None:
     return urls[-1] if urls else None
 
 
+def _is_h264(vcodec: str | None) -> bool:
+    return bool(vcodec) and vcodec.lower().startswith(("avc1", "avc3", "h264"))
+
+
 def pick_smaller_formats(formats: list[dict], duration: float | None, limit_bytes: int) -> str | None:
     """A ``video+audio`` format spec from separate streams that fits ``limit_bytes``, or None.
 
@@ -89,7 +93,8 @@ def pick_smaller_formats(formats: list[dict], duration: float | None, limit_byte
     if not duration or duration <= 0:
         return None
     audios = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")]
-    videos = [f for f in formats if f.get("acodec") == "none" and f.get("vcodec") not in (None, "none") and f.get("tbr")]
+    # H.264 only: Apple's player (Discord on iOS/iPadOS) shows a frozen frame for VP9 in mp4.
+    videos = [f for f in formats if f.get("acodec") == "none" and _is_h264(f.get("vcodec")) and f.get("tbr")]
     if not audios or not videos:
         return None
     audio = max(audios, key=lambda f: f.get("tbr") or f.get("abr") or 0)

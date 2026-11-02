@@ -159,10 +159,11 @@ def test_image_ext_trusts_bytes_over_url():
 IG_FORMATS = [
     {"format_id": "1", "vcodec": None, "acodec": None},
     {"format_id": "dash-a", "vcodec": "none", "acodec": "mp4a.40.5", "tbr": 51},
-    {"format_id": "dash-360", "vcodec": "vp09", "acodec": "none", "tbr": 93},
-    {"format_id": "dash-720lo", "vcodec": "vp09", "acodec": "none", "tbr": 851},
-    {"format_id": "dash-720mid", "vcodec": "vp09", "acodec": "none", "tbr": 1561},
-    {"format_id": "dash-720hi", "vcodec": "vp09", "acodec": "none", "tbr": 2902},
+    {"format_id": "dash-360", "vcodec": "avc1.4d401e", "acodec": "none", "tbr": 93},
+    {"format_id": "dash-720lo", "vcodec": "avc1.64001f", "acodec": "none", "tbr": 851},
+    {"format_id": "dash-720mid", "vcodec": "avc1.64001f", "acodec": "none", "tbr": 1561},
+    {"format_id": "dash-720hi", "vcodec": "avc1.64001f", "acodec": "none", "tbr": 2902},
+    {"format_id": "dash-vp9", "vcodec": "vp09.00.31.08", "acodec": "none", "tbr": 1700},
 ]
 
 
@@ -180,3 +181,8 @@ def test_smaller_formats_none_when_nothing_fits_or_unknown():
     assert pick_smaller_formats(IG_FORMATS, None, 18 * 2**20) is None
     progressive_only = [f for f in IG_FORMATS if not f["format_id"].startswith("dash")]
     assert pick_smaller_formats(progressive_only, 64, 18 * 2**20) is None
+
+
+def test_smaller_formats_skips_vp9():
+    vp9_only = [f for f in IG_FORMATS if not (f["vcodec"] or "").startswith("avc1")]
+    assert pick_smaller_formats(vp9_only, 64, 18 * 2**20) is None
