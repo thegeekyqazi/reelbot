@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from reelbot.downloader import Downloader, DownloadError, best_image_url, image_ext
+from reelbot.downloader import Downloader, DownloadError, best_image_url, image_ext, pick_smaller_formats
 from reelbot.links import ReelLink
 
 
@@ -35,7 +35,7 @@ def _downloader(order: list[str], results: dict) -> Downloader:
     d.has_gallery_dl = True
 
     def fake(name):
-        async def backend(url, outdir, threads):
+        async def backend(url, outdir, threads, limit_bytes):
             order.append(name)
             result = results[name]
             if isinstance(result, Exception):
@@ -153,3 +153,30 @@ def test_image_ext_trusts_bytes_over_url():
     assert image_ext(b"RIFF\0\0\0\0WEBPVP8", "https://x/a") == ".webp"
     assert image_ext(b"????", "https://x/1_n.heic") == ".heic"
     assert image_ext(b"????", "https://x/noext") == ".jpg"
+
+
+# Shaped like yt-dlp's Instagram formats: progressive mp4s, DASH video-only and audio-only streams.
+IG_FORMATS = [
+    {"format_id": "1", "vcodec": None, "acodec": None},
+    {"format_id": "dash-a", "vcodec": "none", "acodec": "mp4a.40.5", "tbr": 51},
+    {"format_id": "dash-360", "vcodec": "vp09", "acodec": "none", "tbr": 93},
+    {"format_id": "dash-720lo", "vcodec": "vp09", "acodec": "none", "tbr": 851},
+    {"format_id": "dash-720mid", "vcodec": "vp09", "acodec": "none", "tbr": 1561},
+    {"format_id": "dash-720hi", "vcodec": "vp09", "acodec": "none", "tbr": 2902},
+]
+
+
+def test_smaller_formats_picks_best_video_that_fits():
+    # 18 MB over 64 s leaves ~2.1 Mbps, so 1561k fits and 2902k doesn't.
+    assert pick_smaller_formats(IG_FORMATS, 64, 18 * 2**20) == "dash-720mid+dash-a"
+
+
+def test_smaller_formats_drops_quality_for_tight_limits():
+    assert pick_smaller_formats(IG_FORMATS, 64, 10 * 2**20) == "dash-720lo+dash-a"
+
+
+def test_smaller_formats_none_when_nothing_fits_or_unknown():
+    assert pick_smaller_formats(IG_FORMATS, 600, 1 * 2**20) is None
+    assert pick_smaller_formats(IG_FORMATS, None, 18 * 2**20) is None
+    progressive_only = [f for f in IG_FORMATS if not f["format_id"].startswith("dash")]
+    assert pick_smaller_formats(progressive_only, 64, 18 * 2**20) is None

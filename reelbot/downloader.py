@@ -7,6 +7,7 @@ import importlib.util
 import logging
 import re
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -79,6 +80,41 @@ def best_image_url(thumbnails: list[dict]) -> str | None:
     return urls[-1] if urls else None
 
 
+def pick_smaller_formats(formats: list[dict], duration: float | None, limit_bytes: int) -> str | None:
+    """A ``video+audio`` format spec from separate streams that fits ``limit_bytes``, or None.
+
+    Instagram serves lower-bitrate DASH renditions next to the full progressive mp4, so an
+    oversized reel can usually be fetched smaller and merged without re-encoding.
+    """
+    if not duration or duration <= 0:
+        return None
+    audios = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")]
+    videos = [f for f in formats if f.get("acodec") == "none" and f.get("vcodec") not in (None, "none") and f.get("tbr")]
+    if not audios or not videos:
+        return None
+    audio = max(audios, key=lambda f: f.get("tbr") or f.get("abr") or 0)
+    audio_kbps = audio.get("tbr") or audio.get("abr") or AUDIO_KBPS
+    budget_kbps = limit_bytes * TARGET_FRACTION * 8 / duration / 1000 - audio_kbps
+    fitting = [f for f in videos if f["tbr"] <= budget_kbps]
+    if not fitting:
+        return None
+    video = max(fitting, key=lambda f: f["tbr"])
+    return f"{video['format_id']}+{audio['format_id']}"
+
+
+def _probe_duration_sync(path: Path) -> float | None:
+    """Duration in seconds via ffprobe, for use inside worker threads; None if unreadable."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+        ).stdout
+        return float(out.strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
 def image_ext(data: bytes, url: str) -> str:
     """File extension from the image's magic bytes; Instagram serves JPEGs under .heic URLs."""
     if data.startswith(b"\xff\xd8\xff"):
@@ -136,7 +172,7 @@ class Downloader:
         await self._sem.acquire()
         threads: list[asyncio.Future] = []
         try:
-            files, errors = await self._download_any(link, workdir, threads)
+            files, errors = await self._download_any(link, workdir, threads, limit_bytes)
             media = await self._fit_all(files, workdir, limit_bytes)
             media.errors = errors
             return media
@@ -154,7 +190,7 @@ class Downloader:
         self._sem.release()
 
     async def _download_any(
-        self, link: ReelLink, workdir: Path, threads: list[asyncio.Future]
+        self, link: ReelLink, workdir: Path, threads: list[asyncio.Future], limit_bytes: int
     ) -> tuple[list[Path], list[str]]:
         """Try each backend in turn.
 
@@ -172,7 +208,7 @@ class Downloader:
             outdir = workdir / name
             outdir.mkdir()
             try:
-                files = await backend(link.url, outdir, threads)
+                files = await backend(link.url, outdir, threads, limit_bytes)
             except DownloadError as e:
                 log.info("%s failed for %s: %s", name, link.url, e)
                 errors.append(e)
@@ -185,8 +221,8 @@ class Downloader:
         generic = "couldn't download that post"
         raise next((e for e in errors if str(e) != generic), errors[0])
 
-    async def _ytdlp(self, url: str, outdir: Path, threads: list[asyncio.Future]) -> list[Path]:
-        fut = asyncio.ensure_future(asyncio.to_thread(self._ytdlp_sync, url, outdir))
+    async def _ytdlp(self, url: str, outdir: Path, threads: list[asyncio.Future], limit_bytes: int) -> list[Path]:
+        fut = asyncio.ensure_future(asyncio.to_thread(self._ytdlp_sync, url, outdir, limit_bytes))
         threads.append(fut)
         try:
             # shield: a timeout must not cancel the future, because the worker
@@ -195,7 +231,7 @@ class Downloader:
         except asyncio.TimeoutError:
             raise DownloadError("download timed out") from None
 
-    def _ytdlp_sync(self, url: str, outdir: Path) -> list[Path]:
+    def _ytdlp_sync(self, url: str, outdir: Path, limit_bytes: int) -> list[Path]:
         opts = {
             "format": "best[ext=mp4]/best",
             "outtmpl": str(outdir / "%(playlist_index|0)03d_%(id)s.%(ext)s"),
@@ -222,11 +258,45 @@ class Downloader:
                         continue
                     if entry.get("formats"):
                         ydl.process_info(entry)
+                        self._refetch_smaller(opts, ydl.prepare_filename(entry), entry, limit_bytes)
                     else:
                         self._save_photo(ydl, entry, outdir)
         except yt_dlp.utils.DownloadError as e:
             raise _friendly_error(str(e)) from e
         return self._collect(outdir)
+
+    def _refetch_smaller(self, opts: dict, path: str, entry: dict, limit_bytes: int) -> None:
+        """Swap an oversized video for a smaller Instagram rendition, merged without re-encoding.
+
+        Leaves the original in place if nothing fits, so ``_fit_all`` can still re-encode it.
+        """
+        original = Path(path)
+        if not self.has_ffmpeg or not original.is_file() or original.stat().st_size <= limit_bytes:
+            return
+        # yt-dlp often has no duration for Instagram; the downloaded file always does.
+        duration = entry.get("duration") or _probe_duration_sync(original)
+        spec = pick_smaller_formats(entry["formats"], duration, limit_bytes)
+        if spec is None:
+            return
+        smaller = original.with_name(original.stem + ".small.%(ext)s")
+        small_opts = {**opts, "format": spec, "merge_output_format": "mp4", "outtmpl": str(smaller)}
+        try:
+            with yt_dlp.YoutubeDL(small_opts) as ydl:
+                ydl.process_ie_result(dict(entry), download=True)
+        except yt_dlp.utils.DownloadError as e:
+            log.info("Smaller rendition failed for %s: %s", entry.get("id"), e)
+        else:
+            merged = original.with_name(original.stem + ".small.mp4")
+            if merged.is_file() and merged.stat().st_size <= limit_bytes:
+                log.info(
+                    "Using %s for %s (%.1f MB instead of %.1f MB)",
+                    spec, entry.get("id"), merged.stat().st_size / 2**20, original.stat().st_size / 2**20,
+                )
+                original.unlink()
+                merged.rename(original.with_suffix(".mp4"))
+        # Drop leftovers (unmerged streams, a still-too-big merge) so they aren't posted.
+        for leftover in original.parent.glob(original.stem + ".small*"):
+            leftover.unlink(missing_ok=True)
 
     @staticmethod
     def _save_photo(ydl: yt_dlp.YoutubeDL, entry: dict, outdir: Path) -> None:
@@ -244,7 +314,7 @@ class Downloader:
         name = f"{entry.get('playlist_index') or 0:03}_{entry.get('id', 'photo')}"
         (outdir / (name + image_ext(data, url))).write_bytes(data)
 
-    async def _gallery_dl(self, url: str, outdir: Path, threads: list[asyncio.Future]) -> list[Path]:
+    async def _gallery_dl(self, url: str, outdir: Path, threads: list[asyncio.Future], limit_bytes: int) -> list[Path]:
         cmd = [
             sys.executable, "-m", "gallery_dl",
             "--config-ignore", "--quiet", "--no-mtime", "--no-part",
