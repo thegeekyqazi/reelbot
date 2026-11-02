@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from reelbot.downloader import Downloader, DownloadError, best_image_url, image_ext, pick_smaller_formats, Rendition
+from reelbot.downloader import Downloader, DownloadError, RateLimited, _friendly_error, best_image_url, image_ext, pick_smaller_formats, Rendition
 from reelbot.links import ReelLink
 
 
@@ -91,6 +91,21 @@ def test_most_useful_error_is_reported(tmp_path):
     })
     with pytest.raises(DownloadError, match="login"):
         run(d.fetch(ReelLink("reel", "ABC"), tmp_path, 1000))
+
+
+def test_rate_limit_skips_other_backends(tmp_path):
+    order = []
+    d = _downloader(order, {"yt-dlp": RateLimited("slow down"), "gallery-dl": ["001_a.mp4"]})
+    with pytest.raises(RateLimited):
+        run(d.fetch(ReelLink("reel", "ABC"), tmp_path, 1000))
+    assert order == ["yt-dlp"]
+
+
+def test_429_is_rate_limit_not_login():
+    err = _friendly_error("ERROR: [Instagram] X: Unable to download webpage: HTTP Error 429: Too Many Requests")
+    assert isinstance(err, RateLimited)
+    assert "login" not in str(err)
+    assert "login" in str(_friendly_error("HTTP Error 401: login required"))
 
 
 def test_without_gallery_dl_only_ytdlp_runs(tmp_path):

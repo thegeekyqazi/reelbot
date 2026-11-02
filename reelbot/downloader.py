@@ -28,11 +28,16 @@ MAX_ITEMS = 20  # Instagram carousels hold at most 20 items
 FFMPEG_TIMEOUT = 240
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".m4v"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic"}
-_LOGIN_HINTS = ("login", "log in", "rate-limit", "rate limit", "cookies", "401", "403", "429")
+_RATE_LIMIT_HINTS = ("429", "too many requests", "rate-limit", "rate limit", "rate-limited")
+_LOGIN_HINTS = ("login", "log in", "cookies", "401", "403")
 
 
 class DownloadError(Exception):
     """A failure with a short, user-safe reason as its message."""
+
+
+class RateLimited(DownloadError):
+    """Instagram refused us for making too many requests; other backends on the same IP will too."""
 
 
 @dataclass
@@ -157,6 +162,8 @@ def image_ext(data: bytes, url: str) -> str:
 
 def _friendly_error(msg: str) -> DownloadError:
     msg = msg.lower()
+    if any(hint in msg for hint in _RATE_LIMIT_HINTS):
+        return RateLimited("Instagram is rate-limiting the bot, try again later")
     if any(hint in msg for hint in _LOGIN_HINTS):
         return DownloadError("Instagram wants a login (cookies missing or expired)")
     if "private" in msg:
@@ -235,6 +242,10 @@ class Downloader:
             outdir.mkdir()
             try:
                 files = await backend(link.url, outdir, threads, limit_bytes)
+            except RateLimited as e:
+                # Every backend shares this IP, so trying the next one only makes the user wait.
+                log.info("%s failed for %s: %s", name, link.url, e)
+                raise
             except DownloadError as e:
                 log.info("%s failed for %s: %s", name, link.url, e)
                 errors.append(e)

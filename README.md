@@ -166,6 +166,7 @@ Cookie files are git-ignored. Never commit them.
 | Every download fails, or fails suddenly after working | Instagram changed something. Upgrade the downloaders: `sudo systemctl start ytdlp-update.service`. This also runs daily |
 | Reels work but photo posts give embed links | Update yt-dlp first (`sudo systemctl start ytdlp-update.service`). If that doesn't help, set `IG_COOKIES` so gallery-dl can log in |
 | "Instagram wants a login" | Cookies are missing or expired. Re-export them (see [Instagram cookies](#instagram-cookies)) |
+| "Instagram is rate-limiting the bot" | Too many downloads from the server's IP (HTTP 429). It usually clears within a few hours; cookies or `IG_PROXY` help if it keeps happening |
 | "too large" / embed link instead of video | Nothing in the post fit under the upload limit, even after compressing. Very long reels won't fit in 10 MB. The embed link still plays inline |
 | "N item(s) were too large to post" | Some carousel items didn't fit and were skipped. The note links to the full post |
 | Commands don't show up | Wait a few minutes after first start, then reload Discord (Ctrl+R). Check the logs for `Synced N global command(s)` |
