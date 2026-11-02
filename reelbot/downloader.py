@@ -189,8 +189,11 @@ class _YtdlpLogger:
 
 
 class Downloader:
-    def __init__(self, cookies: Path | None = None, max_concurrent: int = 2, timeout: float = 90) -> None:
+    def __init__(
+        self, cookies: Path | None = None, max_concurrent: int = 2, timeout: float = 90, proxy: str | None = None
+    ) -> None:
         self.cookies = cookies
+        self.proxy = proxy  # only used to retry after a rate limit, to save proxy bandwidth
         self.timeout = timeout
         self._sem = asyncio.Semaphore(max_concurrent)
         self.has_ffmpeg = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
@@ -245,7 +248,9 @@ class Downloader:
             except RateLimited as e:
                 # Every backend shares this IP, so trying the next one only makes the user wait.
                 log.info("%s failed for %s: %s", name, link.url, e)
-                raise
+                if not self.proxy:
+                    raise
+                return await self._via_proxy(link, workdir, threads, limit_bytes), [str(e)]
             except DownloadError as e:
                 log.info("%s failed for %s: %s", name, link.url, e)
                 errors.append(e)
@@ -258,8 +263,25 @@ class Downloader:
         generic = "couldn't download that post"
         raise next((e for e in errors if str(e) != generic), errors[0])
 
-    async def _ytdlp(self, url: str, outdir: Path, threads: list[asyncio.Future], limit_bytes: int) -> list[Path]:
-        fut = asyncio.ensure_future(asyncio.to_thread(self._ytdlp_sync, url, outdir, limit_bytes))
+    async def _via_proxy(
+        self, link: ReelLink, workdir: Path, threads: list[asyncio.Future], limit_bytes: int
+    ) -> list[Path]:
+        outdir = workdir / "yt-dlp-proxy"
+        outdir.mkdir()
+        try:
+            files = await self._ytdlp(link.url, outdir, threads, limit_bytes, proxy=self.proxy)
+        except DownloadError as e:
+            log.info("yt-dlp via proxy failed for %s: %s", link.url, e)
+            raise
+        if not files:
+            raise DownloadError("nothing downloadable in that post")
+        log.info("yt-dlp via proxy got %d item(s) from %s", len(files), link.url)
+        return files
+
+    async def _ytdlp(
+        self, url: str, outdir: Path, threads: list[asyncio.Future], limit_bytes: int, proxy: str | None = None
+    ) -> list[Path]:
+        fut = asyncio.ensure_future(asyncio.to_thread(self._ytdlp_sync, url, outdir, limit_bytes, proxy))
         threads.append(fut)
         try:
             # shield: a timeout must not cancel the future, because the worker
@@ -268,7 +290,7 @@ class Downloader:
         except asyncio.TimeoutError:
             raise DownloadError("download timed out") from None
 
-    def _ytdlp_sync(self, url: str, outdir: Path, limit_bytes: int) -> list[Path]:
+    def _ytdlp_sync(self, url: str, outdir: Path, limit_bytes: int, proxy: str | None = None) -> list[Path]:
         opts = {
             "format": "best[ext=mp4]/best",
             "outtmpl": str(outdir / "%(playlist_index|0)03d_%(id)s.%(ext)s"),
@@ -286,6 +308,8 @@ class Downloader:
         }
         if self.cookies:
             opts["cookiefile"] = str(self.cookies)
+        if proxy:
+            opts["proxy"] = proxy
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)

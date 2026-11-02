@@ -69,7 +69,9 @@ class ReelBot(discord.Client):
             seed=config.allowed_user_ids,
         )
         self.downloader = Downloader(
-            cookies=config.ig_cookies, max_concurrent=config.max_concurrent_downloads
+            cookies=config.ig_cookies,
+            max_concurrent=config.max_concurrent_downloads,
+            proxy=config.ig_proxy,
         )
         _register_commands(self)
 

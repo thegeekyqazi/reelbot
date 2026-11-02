@@ -52,3 +52,11 @@ def test_parses_optional_values(tmp_path):
 def test_invalid_values(key, value):
     with pytest.raises(ConfigError):
         load_config({**BASE, key: value})
+
+
+def test_proxy_validated_without_leaking_it():
+    env = {**BASE, "IG_PROXY": "socks5h://user:secret@host:1080"}
+    assert load_config(env).ig_proxy == "socks5h://user:secret@host:1080"
+    with pytest.raises(ConfigError) as exc:
+        load_config({**BASE, "IG_PROXY": "user:secret@host:1080"})
+    assert "secret" not in str(exc.value)
