@@ -12,7 +12,7 @@ You install it to your own Discord account ("Add to my apps"), so it goes wherev
 - **Carousels**: every photo and video in the post is posted, in order. That's up to 10 attachments per message, split across messages when needed.
 - **Right-click / long-press a message → Apps → Send reel** finds the first Instagram link in that message and posts its media.
 - Oversized videos: the bot first fetches one of Instagram's smaller renditions and remuxes it without re-encoding (H.264 as mp4, VP9 as WebM so it plays on iOS/iPadOS), which takes seconds. Only if none fits is the video re-encoded with ffmpeg, which can take minutes on an e2-micro. Items that still don't fit are skipped, with a note.
-- Downloads use [yt-dlp](https://github.com/yt-dlp/yt-dlp), which gets videos and photos without a login, with [gallery-dl](https://github.com/mikf/gallery-dl) as a fallback. When cookies are set, `/p/` posts try gallery-dl first.
+- Downloads use [yt-dlp](https://github.com/yt-dlp/yt-dlp), which gets videos and photos without a login, with [gallery-dl](https://github.com/mikf/gallery-dl) as a fallback when cookies are set (`/p/` posts then try gallery-dl first). Without cookies, gallery-dl only hits Instagram's login wall, so it's skipped.
 - If a download or upload fails, the bot posts an embed-fixer link (default `instagramfix.com`) so the reel still plays inline.
 - Allowlist: strangers get an ephemeral "This bot is private." and nothing is downloaded.
 - Owner-only commands, always ephemeral:
@@ -167,6 +167,7 @@ Cookie files are git-ignored. Never commit them.
 | Every download fails, or fails suddenly after working | Instagram changed something. Upgrade the downloaders: `sudo systemctl start ytdlp-update.service`. This also runs daily |
 | Reels work but photo posts give embed links | Update yt-dlp first (`sudo systemctl start ytdlp-update.service`). If that doesn't help, set `IG_COOKIES` so gallery-dl can log in |
 | "Instagram wants a login" | Cookies are missing or expired. Re-export them (see [Instagram cookies](#instagram-cookies)) |
+| "Instagram only shows that post to logged-in users" | The post is age-restricted or marked sensitive. Only cookies from an account that can see it will help |
 | "Instagram is rate-limiting the bot" | Too many downloads from the server's IP (HTTP 429). It usually clears within a few hours; cookies or `IG_PROXY` help if it keeps happening |
 | "too large" / embed link instead of video | Nothing in the post fit under the upload limit, even after compressing. Very long reels won't fit in 10 MB. The embed link still plays inline |
 | "N item(s) were too large to post" | Some carousel items didn't fit and were skipped. The note links to the full post |

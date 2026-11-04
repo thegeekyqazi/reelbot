@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import logging
+import random
 import re
 import shutil
 import subprocess
@@ -45,7 +46,9 @@ def _no_progress(_: str) -> None:
 
 
 # Errors about the post itself: another proxy won't change them.
-_FINAL_ERRORS = ("the post is private", "no video in that post")
+RESTRICTED_MSG = "Instagram only shows that post to logged-in users (age-restricted or sensitive)"
+_FINAL_ERRORS = ("the post is private", "no video in that post", RESTRICTED_MSG)
+_RESTRICTED_HINTS = ("isn't available to everyone", "certain audiences", "age-restricted", "restricted video")
 PROXY_ROUND_SECONDS = 150  # give up on proxies after this long, even if some are untried
 PROXY_SOCKET_TIMEOUT = 10  # dead proxies should fail fast
 
@@ -180,6 +183,8 @@ def _friendly_error(msg: str) -> DownloadError:
         return RateLimited("Instagram is rate-limiting the bot, try again later")
     if any(hint in msg for hint in _LOGIN_HINTS):
         return DownloadError("Instagram wants a login (cookies missing or expired)")
+    if any(hint in msg for hint in _RESTRICTED_HINTS):
+        return DownloadError(RESTRICTED_MSG)
     if "private" in msg:
         return DownloadError("the post is private")
     if "no video" in msg:
@@ -213,7 +218,8 @@ class Downloader:
         self.cookies = cookies
         # Only used to retry after a rate limit, to save proxy bandwidth.
         self.proxies = list(proxies)
-        self._next_proxy = 0  # round-robin start, so one proxy doesn't take every retry
+        # Round-robin, from a random start so daily restarts don't always begin at proxy 1.
+        self._next_proxy = random.randrange(len(self.proxies)) if self.proxies else 0
         self.timeout = timeout
         self._sem = asyncio.Semaphore(max_concurrent)
         self.has_ffmpeg = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
@@ -259,13 +265,15 @@ class Downloader:
     ) -> tuple[list[Path], list[str]]:
         """Try each backend in turn.
 
-        yt-dlp handles photos too, without a login. gallery-dl only goes first for /p/ posts
-        when cookies are set, since anonymously Instagram sends it to the login page.
+        yt-dlp handles photos too, without a login. gallery-dl is only used with cookies,
+        and then goes first for /p/ posts.
         """
         backends = [("yt-dlp", self._ytdlp)]
-        if self.has_gallery_dl:
+        # Anonymous gallery-dl only ever hit Instagram's login wall and then hung until the
+        # timeout, so it's only worth trying with cookies.
+        if self.has_gallery_dl and self.cookies:
             gallery = ("gallery-dl", self._gallery_dl)
-            first = link.kind == "p" and self.cookies
+            first = link.kind == "p"
             backends = [gallery, *backends] if first else [*backends, gallery]
 
         errors: list[DownloadError] = []

@@ -33,6 +33,7 @@ def _downloader(order: list[str], results: dict) -> Downloader:
     """A Downloader whose backends are fakes that record call order."""
     d = Downloader()
     d.has_gallery_dl = True
+    d.cookies = Path("cookies.txt")  # gallery-dl only runs with cookies
 
     def fake(name):
         async def backend(url, outdir, threads, limit_bytes, proxy=None):
@@ -62,11 +63,18 @@ def test_photo_posts_try_gallery_dl_first_with_cookies(tmp_path):
     assert [p.name for p in media.files] == ["001_a.jpg", "002_b.mp4"]
 
 
-def test_photo_posts_try_ytdlp_first_without_cookies(tmp_path):
+def test_no_gallery_dl_without_cookies(tmp_path):
     order = []
-    d = _downloader(order, {"gallery-dl": ["001_a.jpg"], "yt-dlp": ["001_a.jpg"]})
-    run(d.fetch(ReelLink("p", "ABC"), tmp_path, 1000))
+    d = _downloader(order, {"gallery-dl": ["001_a.jpg"], "yt-dlp": DownloadError("couldn't download that post")})
+    d.cookies = None
+    with pytest.raises(DownloadError):
+        run(d.fetch(ReelLink("p", "ABC"), tmp_path, 1000))
     assert order == ["yt-dlp"]
+
+
+def test_restricted_post_is_explained():
+    msg = "ERROR: [Instagram] X: This content isn't available to everyone: It can't be seen by certain audiences."
+    assert "logged-in" in str(_friendly_error(msg))
 
 
 def test_reels_try_ytdlp_first_then_fall_back(tmp_path):
