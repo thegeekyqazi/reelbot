@@ -5,6 +5,8 @@
 cookies*.txt
 *.cookies
 data/
+instalogins*.txt
+chatfromcloudsession.txt
 
 # Python
 __pycache__/

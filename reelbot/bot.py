@@ -11,14 +11,15 @@ import discord
 from discord import app_commands
 
 from .allowlist import Allowlist
+from .ig_auth import SessionPool
 from .config import Config
 from .downloader import Downloader, DownloadError, Media, is_video
-from .links import ReelLink, find_link
+from .links import MediaLink, find_link
 
 log = logging.getLogger(__name__)
 
 PRIVATE_MSG = "This bot is private."
-NO_LINK_MSG = "I couldn't find an Instagram reel or post link there."
+NO_LINK_MSG = "I couldn't find an Instagram post or TikTok video link there."
 OWNER_ONLY_MSG = "Only the bot owner can do that."
 
 MAX_FILES_PER_MESSAGE = 10  # Discord's attachment limit per message
@@ -114,6 +115,8 @@ class ReelBot(discord.Client):
             cookies=config.ig_cookies,
             max_concurrent=config.max_concurrent_downloads,
             proxies=config.ig_proxies,
+            auth=SessionPool(config.ig_accounts, config.ig_proxies, config.data_dir / "ig-sessions", config.ig_cookies)
+            if config.ig_accounts or config.ig_cookies else None,
         )
         _register_commands(self)
 
@@ -168,7 +171,7 @@ class ReelBot(discord.Client):
         await self._send_fallback(interaction, link, reason)
 
     async def _send_media(
-        self, interaction: discord.Interaction, link: ReelLink, media: Media, limit: int
+        self, interaction: discord.Interaction, link: MediaLink, media: Media, limit: int
     ) -> str | None:
         """Upload the files in as few messages as possible. Returns a failure reason, or None.
 
@@ -197,10 +200,11 @@ class ReelBot(discord.Client):
         log.info("sent user=%s link=%s items=%d skipped=%d", interaction.user.id, link.url, sent, media.skipped)
         return None
 
-    async def _send_fallback(self, interaction: discord.Interaction, link: ReelLink, reason: str) -> None:
+    async def _send_fallback(self, interaction: discord.Interaction, link: MediaLink, reason: str) -> None:
+        label = "an embed link" if link.platform == "instagram" else "the original link"
         content = (
             f"{link.embed_url(self.config.embed_fixer_domain)}\n"
-            f"-# Couldn't upload it ({reason}), so here's an embed link instead."
+            f"-# Couldn't upload it ({reason}), so here's {label} instead."
         )
         try:
             await interaction.edit_original_response(content=content, attachments=[])
@@ -211,8 +215,8 @@ class ReelBot(discord.Client):
 def _register_commands(bot: ReelBot) -> None:
     tree = bot.tree
 
-    @tree.command(name="reel", description="Post an Instagram reel, video or photo post")
-    @app_commands.describe(link="Instagram reel or post URL")
+    @tree.command(name="reel", description="Post an Instagram reel/photo post or a TikTok video")
+    @app_commands.describe(link="Instagram post or TikTok video URL (shared short links work too)")
     @installs
     @contexts
     async def reel(interaction: discord.Interaction, link: str) -> None:

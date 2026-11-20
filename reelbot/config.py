@@ -24,6 +24,7 @@ class Config:
     data_dir: Path = Path("./data")
     max_concurrent_downloads: int = 2
     ig_proxies: tuple[str, ...] = ()
+    ig_accounts: Path | None = None
 
     @property
     def max_upload_bytes(self) -> int:
@@ -110,6 +111,13 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         if part.strip()
     )
 
+    accounts_raw = _get(env, "IG_ACCOUNTS")
+    accounts = Path(accounts_raw) if accounts_raw else None
+    if accounts is not None and not accounts.is_file():
+        raise ConfigError("IG_ACCOUNTS must point to an existing private account file")
+    if (accounts is not None or cookies is not None) and not proxies:
+        raise ConfigError("IG_PROXY is required for authenticated Instagram requests")
+
     try:
         max_mb = float(_get(env, "MAX_UPLOAD_MB") or 10)
         concurrency = int(_get(env, "MAX_CONCURRENT_DOWNLOADS") or 2)
@@ -131,4 +139,5 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         data_dir=Path(_get(env, "DATA_DIR") or "./data"),
         max_concurrent_downloads=concurrency,
         ig_proxies=proxies,
+        ig_accounts=accounts,
     )

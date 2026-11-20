@@ -35,6 +35,7 @@ def test_parses_optional_values(tmp_path):
         "ALLOWED_USER_IDS": "222, 333,",
         "ALLOW_EVERYONE": "true",
         "IG_COOKIES": str(cookies),
+        "IG_PROXY": "http://proxy.test:80",
         "MAX_UPLOAD_MB": "25",
         "DATA_DIR": str(tmp_path),
     })

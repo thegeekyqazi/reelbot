@@ -1,4 +1,4 @@
-"""Instagram media download (yt-dlp + gallery-dl) with an ffmpeg re-encode step for oversized videos."""
+"""Instagram/TikTok downloads, with proxy-only Instagram auth and oversized video fitting."""
 
 from __future__ import annotations
 
@@ -9,15 +9,15 @@ import random
 import re
 import shutil
 import subprocess
-import sys
 from dataclasses import dataclass, field
 from typing import Callable
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import yt_dlp
+import requests
 
-from .links import ReelLink
+from .links import MediaLink, ReelLink, TikTokLink, find_link, sanitize_url
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +55,10 @@ PROXY_SOCKET_TIMEOUT = 10  # dead proxies should fail fast
 
 class RateLimited(DownloadError):
     """Instagram refused us for making too many requests; other backends on the same IP will too."""
+
+
+class LoginRequired(DownloadError):
+    """This post needs an authenticated, proxy-routed retry."""
 
 
 @dataclass
@@ -177,19 +181,55 @@ def image_ext(data: bytes, url: str) -> str:
     return ext if ext in IMAGE_EXTS else ".jpg"
 
 
-def _friendly_error(msg: str) -> DownloadError:
+def _friendly_error(msg: str, platform: str = "instagram") -> DownloadError:
     msg = msg.lower()
+    if platform == "tiktok":
+        if any(hint in msg for hint in _RATE_LIMIT_HINTS):
+            return RateLimited("TikTok is rate-limiting the bot, try again later")
+        if any(hint in msg for hint in (*_LOGIN_HINTS, *_RESTRICTED_HINTS)):
+            return DownloadError("TikTok requires a login or blocked access to that video")
+        if "private" in msg:
+            return DownloadError("that TikTok video is private")
+        return DownloadError("couldn't download that TikTok video")
     if any(hint in msg for hint in _RATE_LIMIT_HINTS):
         return RateLimited("Instagram is rate-limiting the bot, try again later")
     if any(hint in msg for hint in _LOGIN_HINTS):
-        return DownloadError("Instagram wants a login (cookies missing or expired)")
+        return LoginRequired("Instagram wants a login (cookies missing or expired)")
     if any(hint in msg for hint in _RESTRICTED_HINTS):
-        return DownloadError(RESTRICTED_MSG)
+        return LoginRequired(RESTRICTED_MSG)
     if "private" in msg:
         return DownloadError("the post is private")
     if "no video" in msg:
         return DownloadError("no video in that post")
     return DownloadError("couldn't download that post")
+
+
+def resolve_tiktok_url(url: str) -> str:
+    """Expand a short link, validating and sanitizing every redirect before following it."""
+    current = sanitize_url(url)
+    with requests.Session() as session:
+        # This is an anonymous TikTok path; do not inherit Instagram/proxy credentials.
+        session.trust_env = False
+        for attempt in range(6):
+            link = find_link(current)
+            if not isinstance(link, TikTokLink):
+                raise DownloadError("TikTok shared link redirects outside TikTok")
+            if not link.is_short:
+                return current
+            if attempt == 5:
+                break
+            try:
+                with session.get(current, allow_redirects=False, stream=True, timeout=10,
+                                 headers={"User-Agent": "facebookexternalhit/1.1"}) as response:
+                    if response.status_code not in (301, 302, 303, 307, 308) or not response.headers.get("Location"):
+                        raise DownloadError("couldn't resolve that TikTok shared link")
+                    try:
+                        current = sanitize_url(urljoin(current, response.headers["Location"]))
+                    except ValueError:
+                        raise DownloadError("TikTok shared link redirects to an unsupported URL") from None
+            except requests.RequestException:
+                raise DownloadError("couldn't resolve that TikTok shared link") from None
+    raise DownloadError("too many redirects in that TikTok shared link")
 
 
 class _YtdlpLogger:
@@ -214,8 +254,10 @@ class Downloader:
         max_concurrent: int = 2,
         timeout: float = 90,
         proxies: list[str] | tuple[str, ...] = (),
+        auth=None,
     ) -> None:
         self.cookies = cookies
+        self.auth = auth
         # Only used to retry after a rate limit, to save proxy bandwidth.
         self.proxies = list(proxies)
         # Round-robin, from a random start so daily restarts don't always begin at proxy 1.
@@ -230,7 +272,7 @@ class Downloader:
             log.warning("gallery-dl not installed; only yt-dlp will be used")
 
     async def fetch(
-        self, link: ReelLink, workdir: Path, limit_bytes: int, progress: Progress = _no_progress
+        self, link: MediaLink, workdir: Path, limit_bytes: int, progress: Progress = _no_progress
     ) -> Media:
         """Download every photo/video in ``link`` into ``workdir``, each fitting ``limit_bytes``."""
         if self._sem.locked():
@@ -238,69 +280,55 @@ class Downloader:
         await self._sem.acquire()
         threads: list[asyncio.Future] = []
         try:
-            files, errors = await self._download_any(link, workdir, threads, limit_bytes, progress)
+            try:
+                files, errors = await self._download_any(link, workdir, threads, limit_bytes, progress)
+            except LoginRequired:
+                if self.auth is None or not isinstance(link, ReelLink):
+                    raise
+                progress("This post needs a login. Retrying through an account's proxy…")
+                outdir = workdir / "authenticated"
+                outdir.mkdir()
+                files = await self.auth.fetch(link.url, outdir, limit_bytes)
+                errors = []
             media = await self._fit_all(files, workdir, limit_bytes, progress)
             media.errors = errors
             return media
         finally:
             # A timed-out yt-dlp thread can't be killed; keep its slot taken until it ends.
-            running = next((t for t in threads if not t.done()), None)
-            if running is not None:
-                running.add_done_callback(self._release_after_thread)
+            running = {t for t in threads if not t.done()}
+            if running:
+                def finished(fut):
+                    if not fut.cancelled():
+                        fut.exception()
+                    running.discard(fut)
+                    if not running:
+                        self._sem.release()
+                for task in running:
+                    task.add_done_callback(finished)
             else:
                 self._sem.release()
 
-    def _release_after_thread(self, fut: asyncio.Future) -> None:
-        if not fut.cancelled():
-            fut.exception()  # mark as retrieved so asyncio doesn't warn
-        self._sem.release()
-
     async def _download_any(
         self,
-        link: ReelLink,
+        link: MediaLink,
         workdir: Path,
         threads: list[asyncio.Future],
         limit_bytes: int,
         progress: Progress = _no_progress,
     ) -> tuple[list[Path], list[str]]:
-        """Try each backend in turn.
-
-        yt-dlp handles photos too, without a login. gallery-dl is only used with cookies,
-        and then goes first for /p/ posts.
-        """
-        backends = [("yt-dlp", self._ytdlp)]
-        # Anonymous gallery-dl only ever hit Instagram's login wall and then hung until the
-        # timeout, so it's only worth trying with cookies.
-        if self.has_gallery_dl and self.cookies:
-            gallery = ("gallery-dl", self._gallery_dl)
-            first = link.kind == "p"
-            backends = [gallery, *backends] if first else [*backends, gallery]
-
-        errors: list[DownloadError] = []
-        for n, (name, backend) in enumerate(backends):
-            outdir = workdir / name
-            outdir.mkdir()
-            if n:
-                progress(f"First try failed ({errors[-1]}), trying another downloader…")
-            try:
-                files = await backend(link.url, outdir, threads, limit_bytes)
-            except RateLimited as e:
-                # Every backend shares this IP, so trying the next one only makes the user wait.
-                log.info("%s failed for %s: %s", name, link.url, e)
-                if not self.proxies:
-                    raise
-                return await self._via_proxies(link, workdir, threads, limit_bytes, progress), [str(e)]
-            except DownloadError as e:
-                log.info("%s failed for %s: %s", name, link.url, e)
-                errors.append(e)
-                continue
-            if files:
-                log.info("%s got %d item(s) from %s", name, len(files), link.url)
-                return files, [str(e) for e in errors]
-            errors.append(DownloadError("nothing downloadable in that post"))
-        # Prefer the most actionable reason, e.g. a login problem over a generic failure.
-        generic = "couldn't download that post"
-        raise next((e for e in errors if str(e) != generic), errors[0])
+        """Anonymous first, then anonymous proxies for rate limits. No account cookies here."""
+        outdir = workdir / "yt-dlp"
+        outdir.mkdir()
+        try:
+            files = await self._ytdlp(link.url, outdir, threads, limit_bytes)
+        except RateLimited as exc:
+            if not self.proxies or not isinstance(link, ReelLink):
+                raise
+            return await self._via_proxies(link, workdir, threads, limit_bytes, progress), [str(exc)]
+        if not files:
+            raise DownloadError("nothing downloadable in that post")
+        log.info("yt-dlp got %d item(s) from %s", len(files), link.url)
+        return files, []
 
     async def _via_proxies(
         self,
@@ -353,7 +381,20 @@ class Downloader:
         except asyncio.TimeoutError:
             raise DownloadError("download timed out") from None
 
-    def _ytdlp_sync(self, url: str, outdir: Path, limit_bytes: int, proxy: str | None = None) -> list[Path]:
+    def _ytdlp_sync(
+        self, url: str, outdir: Path, limit_bytes: int, proxy: str | None = None, cookies: Path | None = None
+    ) -> list[Path]:
+        if cookies is not None and not proxy:
+            raise DownloadError("authenticated downloads require a proxy")
+        try:
+            url = sanitize_url(url)
+        except ValueError:
+            raise DownloadError("invalid Instagram post or TikTok video URL") from None
+        link = find_link(url)
+        if isinstance(link, TikTokLink):
+            if cookies is not None or proxy is not None:
+                raise DownloadError("Instagram authentication and proxies cannot be used for TikTok")
+            url = resolve_tiktok_url(url)
         opts = {
             "format": "best[ext=mp4]/best",
             "outtmpl": str(outdir / "%(playlist_index|0)03d_%(id)s.%(ext)s"),
@@ -369,8 +410,12 @@ class Downloader:
             # Photos have no formats; resolve first, then download videos and save photos separately.
             "ignore_no_formats_error": True,
         }
-        if self.cookies:
-            opts["cookiefile"] = str(self.cookies)
+        if isinstance(link, TikTokLink):
+            opts["proxy"] = ""  # ignore proxy environment variables, stay anonymous
+            opts["noplaylist"] = True
+            opts["ignore_no_formats_error"] = False
+        if cookies is not None:
+            opts["cookiefile"] = str(cookies)
         if proxy:
             opts["proxy"] = proxy
             opts["socket_timeout"] = PROXY_SOCKET_TIMEOUT
@@ -387,7 +432,7 @@ class Downloader:
                     else:
                         self._save_photo(ydl, entry, outdir)
         except yt_dlp.utils.DownloadError as e:
-            raise _friendly_error(str(e)) from e
+            raise _friendly_error(str(e), link.platform) from e
         return self._collect(outdir)
 
     def _refetch_smaller(self, opts: dict, path: str, entry: dict, limit_bytes: int) -> None:
@@ -449,31 +494,6 @@ class Downloader:
         # Same naming as outtmpl so photos and videos sort into post order.
         name = f"{entry.get('playlist_index') or 0:03}_{entry.get('id', 'photo')}"
         (outdir / (name + image_ext(data, url))).write_bytes(data)
-
-    async def _gallery_dl(self, url: str, outdir: Path, threads: list[asyncio.Future], limit_bytes: int) -> list[Path]:
-        cmd = [
-            sys.executable, "-m", "gallery_dl",
-            "--config-ignore", "--quiet", "--no-mtime", "--no-part",
-            "--directory", str(outdir),
-            "--filename", "{num:>03}_{media_id}.{extension}",
-            "--range", f"1-{MAX_ITEMS}",
-            "--http-timeout", "20",
-            # Plain progressive mp4s (video + audio in one file) instead of DASH merging.
-            "-o", "extractor.instagram.videos=merged",
-            "-o", f"cache.file={outdir / '.cache.sqlite3'}",
-        ]
-        if self.cookies:
-            cmd += ["--cookies", str(self.cookies)]
-        cmd.append(url)
-        try:
-            returncode, _, stderr = await self._exec(cmd, self.timeout)
-        except asyncio.TimeoutError:
-            raise DownloadError("download timed out") from None
-        files = self._collect(outdir)
-        if returncode != 0 and not files:
-            log.warning("gallery-dl exited %s: %s", returncode, stderr[-500:])
-            raise _friendly_error(stderr)
-        return files
 
     @staticmethod
     def _collect(outdir: Path) -> list[Path]:

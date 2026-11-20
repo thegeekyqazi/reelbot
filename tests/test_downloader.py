@@ -54,13 +54,13 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def test_photo_posts_try_gallery_dl_first_with_cookies(tmp_path):
+def test_photo_posts_stay_anonymous_even_with_configured_cookies(tmp_path):
     order = []
     d = _downloader(order, {"gallery-dl": ["001_a.jpg", "002_b.mp4"], "yt-dlp": ["x.mp4"]})
     d.cookies = Path("cookies.txt")
     media = run(d.fetch(ReelLink("p", "ABC"), tmp_path, 1000))
-    assert order == ["gallery-dl"]
-    assert [p.name for p in media.files] == ["001_a.jpg", "002_b.mp4"]
+    assert order == ["yt-dlp"]
+    assert [p.name for p in media.files] == ["x.mp4"]
 
 
 def test_no_gallery_dl_without_cookies(tmp_path):
@@ -77,12 +77,12 @@ def test_restricted_post_is_explained():
     assert "logged-in" in str(_friendly_error(msg))
 
 
-def test_reels_try_ytdlp_first_then_fall_back(tmp_path):
+def test_generic_failure_does_not_expose_account(tmp_path):
     order = []
     d = _downloader(order, {"yt-dlp": DownloadError("couldn't download that post"), "gallery-dl": ["001_a.mp4"]})
-    media = run(d.fetch(ReelLink("reel", "ABC"), tmp_path, 1000))
-    assert order == ["yt-dlp", "gallery-dl"]
-    assert len(media.files) == 1
+    with pytest.raises(DownloadError):
+        run(d.fetch(ReelLink("reel", "ABC"), tmp_path, 1000))
+    assert order == ["yt-dlp"]
 
 
 def test_empty_result_falls_back(tmp_path):
@@ -90,12 +90,12 @@ def test_empty_result_falls_back(tmp_path):
     d = _downloader(order, {"gallery-dl": [], "yt-dlp": ["0_a.mp4"]})
     d.cookies = Path("cookies.txt")
     run(d.fetch(ReelLink("p", "ABC"), tmp_path, 1000))
-    assert order == ["gallery-dl", "yt-dlp"]
+    assert order == ["yt-dlp"]
 
 
 def test_most_useful_error_is_reported(tmp_path):
     d = _downloader([], {
-        "yt-dlp": DownloadError("couldn't download that post"),
+        "yt-dlp": _friendly_error("login required"),
         "gallery-dl": DownloadError("Instagram wants a login (cookies missing or expired)"),
     })
     with pytest.raises(DownloadError, match="login"):
@@ -154,11 +154,11 @@ def test_private_post_stops_proxy_retries(tmp_path):
 
 def test_proxy_unused_without_rate_limit(tmp_path):
     order, seen = [], []
-    d = _downloader(order, {"yt-dlp": DownloadError("couldn't download that post"), "gallery-dl": ["001_a.mp4"]})
+    d = _downloader(order, {"yt-dlp": ["001_a.mp4"], "gallery-dl": []})
     d.proxies = ["p1"]
     run(d.fetch(ReelLink("reel", "ABC"), tmp_path, 1000, seen.append))
-    assert order == ["yt-dlp", "gallery-dl"]
-    assert seen == ["First try failed (couldn't download that post), trying another downloader…"]
+    assert order == ["yt-dlp"]
+    assert seen == []
 
 
 def test_429_is_rate_limit_not_login():
@@ -193,7 +193,7 @@ def test_everything_too_large_raises(tmp_path):
 
 
 def test_semaphore_released_after_fetch(tmp_path):
-    d = _downloader([], {"gallery-dl": ["001_a.jpg"], "yt-dlp": []})
+    d = _downloader([], {"yt-dlp": ["001_a.jpg"]})
     run(d.fetch(ReelLink("p", "ABC"), tmp_path, 1000))
     assert not d._sem.locked() and d._sem._value == 2
 

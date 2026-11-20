@@ -1,6 +1,6 @@
 # reelbot
 
-A Discord **user-installable app** that downloads Instagram reels, videos and photo posts (including carousels) and posts them as files in any chat: DMs, **group DMs** (where normal bots can't be added), and servers.
+A Discord **user-installable app** that downloads Instagram reels/photo posts (including carousels) and TikTok videos, then posts them as files in any chat: DMs, **group DMs** (where normal bots can't be added), and servers.
 
 You install it to your own Discord account ("Add to my apps"), so it goes wherever you go. It's private by default: only you and the people you add to the allowlist can use your copy.
 
@@ -8,19 +8,22 @@ You install it to your own Discord account ("Add to my apps"), so it goes wherev
 
 ## Features
 
-- `/reel link:<instagram url>` posts the reel as an mp4 that everyone in the chat can see. Photo posts are posted as images.
+- `/reel link:<instagram or tiktok url>` posts the video as a file that everyone in the chat can see. Instagram photo posts are posted as images.
 - **Carousels**: every photo and video in the post is posted, in order. That's up to 10 attachments per message, split across messages when needed.
-- **Right-click / long-press a message → Apps → Send reel** finds the first Instagram link in that message and posts its media.
+- **Right-click / long-press a message → Apps → Send reel** finds the first Instagram or TikTok link in that message and posts its media.
 - Oversized videos: the bot first fetches one of Instagram's smaller renditions and remuxes it without re-encoding (H.264 as mp4, VP9 as WebM so it plays on iOS/iPadOS), which takes seconds. Only if none fits is the video re-encoded with ffmpeg, which can take minutes on an e2-micro. Items that still don't fit are skipped, with a note.
-- Downloads use [yt-dlp](https://github.com/yt-dlp/yt-dlp), which gets videos and photos without a login, with [gallery-dl](https://github.com/mikf/gallery-dl) as a fallback when cookies are set (`/p/` posts then try gallery-dl first). Without cookies, gallery-dl only hits Instagram's login wall, so it's skipped.
-- If a download or upload fails, the bot posts an embed-fixer link (default `instagramfix.com`) so the reel still plays inline.
+- Downloads first use [yt-dlp](https://github.com/yt-dlp/yt-dlp) without an account. Login-required posts retry with a saved account session through its assigned proxy, with [gallery-dl](https://github.com/mikf/gallery-dl) as an authenticated fallback. [Instaloader](https://instaloader.github.io/module/instaloader.html) creates sessions and supports two-factor login.
+- If a download or upload fails, the bot posts an Instagram embed-fixer link (default `instagramfix.com`) or the sanitized original TikTok link.
+- TikTok supports full `tiktok.com/@user/video/<id>` URLs and shared `vm.tiktok.com`, `vt.tiktok.com`, and `tiktok.com/t/…` links. Shared links expand only to supported TikTok media URLs. TikTok downloads are anonymous and do not use Instagram accounts, cookies or proxies.
 - Allowlist: strangers get an ephemeral "This bot is private." and nothing is downloaded.
 - Owner-only commands, always ephemeral:
   - `/allow user:<user>`: add someone to the allowlist
   - `/disallow user:<user>`: remove someone
   - `/allowlist`: show who's allowed
 
-Supported links: `instagram.com/reel/…`, `/reels/…`, `/p/…`, `/tv/…`, with or without `www.` and tracking parameters.
+Supported Instagram links: `instagram.com/reel/…`, `/reels/…`, `/p/…`, `/tv/…`, with or without `www.` and tracking parameters.
+
+Shared links are sanitized before processing: all query parameters (including `igsh`, `igshid`, `utm_*`, and TikTok share trackers) and fragments are removed. Only canonical media URLs reach the downloaders, including authenticated Instagram retries and fallbacks. TikTok short-link redirect targets are sanitized too.
 
 <!-- Screenshots: add images to docs/ and link them here. -->
 _Screenshots coming soon._
@@ -51,8 +54,9 @@ All settings are environment variables. They're read from `.env` in the working 
 | `OWNER_ID` | yes | | Your Discord user ID. Always allowed, and the only user who can manage the allowlist |
 | `ALLOWED_USER_IDS` | no | | Comma-separated IDs that seed the allowlist on first run |
 | `ALLOW_EVERYONE` | no | `false` | `true` disables the allowlist |
-| `IG_COOKIES` | no | | Path to a Netscape-format Instagram `cookies.txt` |
-| `IG_PROXY` | no | | Comma-separated proxies: URLs (`http://`, `https://`, `socks5://`, `socks5h://`) or `host:port:user:pass`. Only used after Instagram rate-limits the server, trying each in turn (up to 150 s), so they cost little bandwidth |
+| `IG_COOKIES` | no | | Path to a Netscape-format Instagram `cookies.txt`, used for authenticated retries when no account file is configured. Requires `IG_PROXY` |
+| `IG_ACCOUNTS` | no | | Private account file for login-required retries; see below. Requires `IG_PROXY` |
+| `IG_PROXY` | no | | Comma-separated proxies: URLs (`http://`, `https://`, `socks5://`, `socks5h://`) or `host:port:user:pass`. Used for anonymous rate-limit retries (up to 150 s between attempt starts) and every authenticated login/download |
 | `MAX_UPLOAD_MB` | no | `10` | Upload limit. The bot also respects the smaller limit Discord reports per interaction |
 | `EMBED_FIXER_DOMAIN` | no | `instagramfix.com` | Domain for the fallback link. Swap it if that service goes down |
 | `DATA_DIR` | no | `./data` | Holds `allowlist.json` |
@@ -146,7 +150,25 @@ The service runs as the unprivileged `reelbot` user with systemd hardening: `Pro
 
 ## Instagram cookies
 
-Reels and photos usually download without a login, but Instagram often blocks anonymous downloads from cloud IPs. If downloads fail with a login or rate-limit message, give the bot cookies from a logged-in session. The same file is used by both yt-dlp and gallery-dl:
+### Automatic account login for restricted posts
+
+Set `IG_ACCOUNTS=/opt/reelbot/data/instagram-accounts.txt` and `IG_PROXY` to enable automatic login when a post requires an account. Keep the account file owned by `reelbot`, mode `600`. Each nonblank line is one of:
+
+```text
+username:password
+username:password:TOTP-secret
+username:password:email:email-password:TOTP-secret
+```
+
+The five-field format ignores the email fields. Do not use colons inside fields. The bot generates a two-factor code when Instagram requests one and a TOTP secret is supplied. It never reads an email inbox.
+
+Public downloads stay anonymous. Login-required requests select one available account, retain its session, and send login, two-factor verification, extraction, and media downloads through its assigned proxy. Proxy bindings persist across restarts and proxy-list reordering; removing an assigned proxy disables that session rather than moving it to another exit. A proxy URL can still use a rotating exit IP; use a stable/sticky endpoint when possible. Proxies do not guarantee protection from account suspension.
+
+Private session cookies and retry state live under `DATA_DIR/ig-sessions/` (directory mode `700`, files `600`). Failed logins and proxy failures pause an account for an hour, including across restarts. Checkpoint/challenge responses pause it until an operator resolves the account check and clears `paused` in its state JSON. An account that Instagram does not permit to view a post may still fail. No authentication failure falls back to sending credentials directly from the VM.
+
+### Existing browser cookies
+
+Reels and photos usually download without a login, but some posts require one. As an alternative to an account file, give the bot cookies from a logged-in session and configure `IG_PROXY`. The same cookies are used by yt-dlp and gallery-dl for authenticated retries:
 
 1. Use a **throwaway Instagram account**, never your personal one. It may get flagged or banned.
 2. Log in to it in a browser and export cookies in **Netscape format** with a "cookies.txt" browser extension.
@@ -178,7 +200,8 @@ Cookie files are git-ignored. Never commit them.
 
 ## Limitations / out of scope
 
-- Stories, private accounts, and other sites such as TikTok or YouTube aren't supported (yet).
+- Instagram Stories, private accounts, TikTok photo slideshows/live streams/profiles, and other sites such as YouTube aren't supported.
+- TikTok may block downloads or require a login in some regions; those failures return the sanitized TikTok link.
 - No web dashboard or database. The allowlist is a JSON file.
 
 ## Usage note
